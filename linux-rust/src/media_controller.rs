@@ -1,14 +1,15 @@
 use crate::bluetooth::aacp::AACPManager;
-use crate::bluetooth::aacp::{ControlCommandIdentifiers, EarDetectionStatus};
+use crate::bluetooth::aacp::{AudioSource, AudioSourceType, ControlCommandIdentifiers, EarDetectionStatus};
 use crate::audio::{
     A2dpAction, AudioBackend, audio_lock_for, find_bluez_card, get_sink_name_by_mac,
     get_sink_volume_percent_by_name_sync, plan_a2dp_activation, transition_sink_volume,
 };
+use crate::prefs::{DevicePrefs, PrefsStore};
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 struct MediaControllerState {
@@ -19,10 +20,13 @@ struct MediaControllerState {
     old_in_ear_data: Vec<bool>,
     user_played_the_media: bool,
     i_paused_the_media: bool,
-    ear_detection_enabled: bool,
-    disconnect_when_not_wearing: bool,
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
+    /// Conversation awareness paused media (pause mode), so its end may resume it.
+    conv_paused_media: bool,
+    /// After losing the AirPods to another device, local playback doesn't take them back
+    /// until this moment.
+    takeover_suppressed_until: Option<Instant>,
 }
 
 impl MediaControllerState {
@@ -35,10 +39,10 @@ impl MediaControllerState {
             old_in_ear_data: vec![false, false],
             user_played_the_media: false,
             i_paused_the_media: false,
-            ear_detection_enabled: true,
-            disconnect_when_not_wearing: true,
             conv_original_volume: None,
             conv_conversation_started: false,
+            conv_paused_media: false,
+            takeover_suppressed_until: None,
         }
     }
 }
@@ -50,12 +54,19 @@ pub struct MediaController {
     /// Serializes every card-profile change for this MAC, across all instances, so concurrent
     /// triggers can't race each other. Shared via `audio_lock_for`.
     audio_op: Arc<Mutex<()>>,
+    /// The user's behaviour preferences, read fresh at every decision.
+    prefs: PrefsStore,
     a2dp_wait_attempts: u32,
     a2dp_wait_interval: Duration,
 }
 
 impl MediaController {
-    pub fn new(connected_mac: String, local_mac: String, backend: Arc<dyn AudioBackend>) -> Self {
+    pub fn new(
+        connected_mac: String,
+        local_mac: String,
+        backend: Arc<dyn AudioBackend>,
+        prefs: PrefsStore,
+    ) -> Self {
         let audio_op = audio_lock_for(&connected_mac);
         let mut state = MediaControllerState::new();
         state.connected_device_mac = connected_mac;
@@ -64,9 +75,23 @@ impl MediaController {
             state: Arc::new(Mutex::new(state)),
             backend,
             audio_op,
+            prefs,
             a2dp_wait_attempts: 10,
             a2dp_wait_interval: Duration::from_millis(500),
         }
+    }
+
+    /// Stops local playback from taking the AirPods back for `duration`.
+    pub async fn suppress_takeover(&self, duration: Duration) {
+        self.state.lock().await.takeover_suppressed_until = Some(Instant::now() + duration);
+    }
+
+    pub async fn takeover_suppressed(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .takeover_suppressed_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     #[cfg(test)]
@@ -97,20 +122,31 @@ impl MediaController {
             let was_playing = state.is_playing;
             state.is_playing = is_playing;
             let local_mac = state.local_mac.clone();
+            let mac = state.connected_device_mac.clone();
             drop(state);
 
             if !was_playing && is_playing {
                 // Copy what we need and release the AACP lock before sending anything:
                 // sending packets locks the same state.
-                let (ear_status, connected_devices) = {
+                let (ear_status, connected_devices, audio_source) = {
                     let aacp_state = aacp_manager.state.lock().await;
                     (
                         aacp_state.ear_detection_status.clone(),
                         aacp_state.connected_devices.clone(),
+                        aacp_state.audio_source.clone(),
                     )
                 };
                 if !should_take_over(was_playing, is_playing, &ear_status) {
                     info!("Media playback started but buds not in ear, skipping takeover");
+                    continue;
+                }
+                let prefs = self.prefs.device(&mac);
+                let suppressed = self.takeover_suppressed().await;
+                if !takeover_allowed(&prefs, audio_source.as_ref(), &local_mac, suppressed) {
+                    info!(
+                        "Media playback started, but not taking over (suppressed: {}, audio source: {:?})",
+                        suppressed, audio_source
+                    );
                     continue;
                 }
                 info!("Media playback started, taking ownership and activating a2dp");
@@ -190,12 +226,11 @@ impl MediaController {
             in_ear, old_all_out, new_has_at_least_one_in, new_all_out
         );
 
-        {
-            let state = self.state.lock().await;
-            if !state.ear_detection_enabled {
-                debug!("Ear detection disabled, skipping");
-                return;
-            }
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        let prefs = self.prefs.device(&mac);
+        if !prefs.ear_detection {
+            debug!("Ear detection disabled, skipping");
+            return;
         }
 
         if new_has_at_least_one_in && old_all_out {
@@ -211,13 +246,9 @@ impl MediaController {
         } else if new_all_out {
             debug!("Condition met: buds removed, pausing media");
             self.pause().await;
-            {
-                let state = self.state.lock().await;
-                if state.disconnect_when_not_wearing {
-                    debug!("Disconnect when not wearing enabled, deactivating A2DP");
-                    drop(state);
-                    self.deactivate_a2dp_profile().await;
-                }
+            if prefs.disconnect_when_not_wearing {
+                debug!("Disconnect when not wearing enabled, deactivating A2DP");
+                self.deactivate_a2dp_profile().await;
             }
         }
 
@@ -339,7 +370,8 @@ impl MediaController {
         }
     }
 
-    async fn pause(&self) {
+    /// Pauses every playing player and remembers them for `resume`. Returns whether any were.
+    async fn pause(&self) -> bool {
         debug!("Pausing playback");
 
         let paused_services = tokio::task::spawn_blocking(|| {
@@ -387,8 +419,10 @@ impl MediaController {
             let mut state = self.state.lock().await;
             state.paused_by_app_services = paused_services;
             state.is_playing = false;
+            true
         } else {
             info!("No playing media players found to pause");
+            false
         }
     }
 
@@ -483,6 +517,11 @@ impl MediaController {
         self.mpris_command("Next").await;
     }
 
+    pub async fn play_pause(&self) {
+        info!("Toggling play/pause");
+        self.mpris_command("PlayPause").await;
+    }
+
     pub async fn previous_track(&self) {
         info!("Going to previous track");
         self.mpris_command("Previous").await;
@@ -531,6 +570,27 @@ impl MediaController {
             debug!("No connected device MAC, skipping conversational awareness");
             return;
         }
+        let prefs = self.prefs.device(&mac);
+
+        if prefs.conversation_pause_music {
+            match conversation_action(status, 0, &prefs) {
+                ConversationAction::Pause => {
+                    if self.pause().await {
+                        info!("Conversation start: paused media");
+                        self.state.lock().await.conv_paused_media = true;
+                    }
+                }
+                ConversationAction::Resume => {
+                    self.resume_after_conversation().await;
+                    // Ducking may have started before the user switched to pause mode.
+                    if let Some(sink) = get_sink_name_by_mac(&mac).await {
+                        self.restore_volume_if_needed(&sink).await;
+                    }
+                }
+                _ => debug!("Conversation status ({}), nothing to do in pause mode", status),
+            }
+            return;
+        }
 
         let sink = match get_sink_name_by_mac(&mac).await {
             Some(s) => s,
@@ -543,103 +603,66 @@ impl MediaController {
             }
         };
 
-        let current_volume_opt = tokio::task::spawn_blocking({
+        let current_volume = tokio::task::spawn_blocking({
             let sink = sink.clone();
             move || get_sink_volume_percent_by_name_sync(&sink)
         })
-            .await
-            .unwrap_or(None);
+        .await
+        .unwrap_or(None);
 
-        match status {
-            1 => {
-                let original = current_volume_opt.unwrap_or(0);
-                debug!("Conversation start (1). Current volume: {}", original);
+        // The volume before ducking: remembered once a conversation starts.
+        let original = {
+            let state = self.state.lock().await;
+            if state.conv_conversation_started {
+                state.conv_original_volume.or(current_volume)
+            } else {
+                current_volume
+            }
+        };
+
+        match conversation_action(status, original.unwrap_or(0), &prefs) {
+            ConversationAction::Duck(_) if original.is_none() => {
+                debug!("Current volume unknown, not lowering it");
+            }
+            ConversationAction::Duck(target) => {
                 {
                     let mut state = self.state.lock().await;
                     if !state.conv_conversation_started {
-                        state.conv_original_volume = Some(original);
+                        state.conv_original_volume = original;
                         state.conv_conversation_started = true;
-                    } else {
-                        debug!(
-                            "Conversation already started; not overwriting conv_original_volume"
-                        );
                     }
                 }
-                if original > 25 {
-                    let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, 25))
-                        .await
-                        .unwrap_or(false);
-                    info!(
-                        "Conversation start: lowered volume to 25% (original {})",
-                        original
-                    );
-                } else {
-                    debug!("Original volume {} <= 25, not reducing to 25", original);
-                }
-            }
-            2 => {
-                let original = self.state.lock().await.conv_original_volume;
-                if let Some(orig) = original {
-                    debug!("Conversation reduce (2). Original: {}", orig);
-                    if orig > 15 {
-                        let sink_clone = sink.clone();
-                        tokio::task::spawn_blocking(move || {
-                            transition_sink_volume(&sink_clone, 15)
-                        })
-                            .await
-                            .unwrap_or(false);
-                        info!(
-                            "Conversation reduce: lowered volume to 15% (original {})",
-                            orig
-                        );
-                    } else {
-                        debug!("Original {} <= 15, not reducing to 15", orig);
-                    }
-                } else {
-                    debug!("No original volume known for status 2, skipping");
-                }
-            }
-            3 => {
-                let (conv_started, conv_original) = {
-                    let state = self.state.lock().await;
-                    (state.conv_conversation_started, state.conv_original_volume)
-                };
-                if !conv_started {
-                    debug!("Received status 3 but conversation was not started; ignoring increase");
-                    return;
-                }
-                if let Some(orig) = conv_original {
-                    let target = orig.min(25);
+                if current_volume != Some(target) {
                     let sink_clone = sink.clone();
                     tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, target))
                         .await
                         .unwrap_or(false);
                     info!(
-                        "Conversation partial increase (3): set volume to {} (original {})",
-                        target, orig
+                        "Conversation level {}: volume {:?} -> {} (original {:?})",
+                        status, current_volume, target, original
                     );
-                } else if let Some(orig_from_current) = current_volume_opt {
-                    let target = orig_from_current.min(25);
-                    let sink_clone = sink.clone();
-                    tokio::task::spawn_blocking(move || transition_sink_volume(&sink_clone, target))
-                        .await
-                        .unwrap_or(false);
-                    info!(
-                        "Conversation partial increase (3) with fallback current: set volume to {} (measured {})",
-                        target, orig_from_current
-                    );
-                } else {
-                    debug!("No original volume known for status 3, skipping");
                 }
             }
-            4 | 6 | 7 => {
+            ConversationAction::Restore => {
                 debug!("Conversation end ({}), restoring volume if needed", status);
                 self.restore_volume_if_needed(&sink).await;
+                // Pause mode may have paused media before the user switched to ducking.
+                self.resume_after_conversation().await;
             }
-            _ => {
-                debug!("Conversation status ({}), ignoring", status);
-            }
+            _ => debug!("Conversation status ({}), ignoring", status),
+        }
+    }
+
+    /// Resumes what conversation awareness paused, but only while an AirPod is still worn.
+    async fn resume_after_conversation(&self) {
+        let resume = {
+            let mut state = self.state.lock().await;
+            let wearing = state.old_in_ear_data.iter().any(|&in_ear| in_ear);
+            std::mem::take(&mut state.conv_paused_media) && wearing
+        };
+        if resume {
+            info!("Conversation end: resuming media");
+            self.resume().await;
         }
     }
 
@@ -738,10 +761,71 @@ pub fn should_take_over(was_playing: bool, is_playing: bool, ear: &[EarDetection
     !was_playing && is_playing && ear.contains(&EarDetectionStatus::InEar)
 }
 
+/// What a conversation-awareness level (opcode 0x4B) asks the app to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationAction {
+    /// Set the volume to this percentage.
+    Duck(u32),
+    Restore,
+    Pause,
+    Resume,
+    Nothing,
+}
+
+/// Levels: 1 start speaking, 2 lower further, 3 partly back up, 4/6/7/8/9 stopped.
+/// `original` is the volume before ducking started.
+pub fn conversation_action(level: u8, original: u32, prefs: &DevicePrefs) -> ConversationAction {
+    use ConversationAction::*;
+    let ended = matches!(level, 4 | 6 | 7 | 8 | 9);
+    if prefs.conversation_pause_music {
+        return match level {
+            1 => Pause,
+            _ if ended => Resume,
+            _ => Nothing,
+        };
+    }
+    let target = |percent: u8| {
+        let percent = u32::from(percent.min(100));
+        if prefs.conversation_relative {
+            original * percent / 100
+        } else {
+            original.min(percent)
+        }
+    };
+    match level {
+        1 | 3 => Duck(target(prefs.conversation_volume)),
+        2 => Duck(target(prefs.conversation_reduced_volume)),
+        _ if ended => Restore,
+        _ => Nothing,
+    }
+}
+
+/// Whether local playback may take the AirPods from whatever they are doing now. `source` is
+/// the AirPods' last reported audio source (opcode 0x0E).
+pub fn takeover_allowed(
+    prefs: &DevicePrefs,
+    source: Option<&AudioSource>,
+    local_mac: &str,
+    suppressed: bool,
+) -> bool {
+    if suppressed || !prefs.takeover_on_media_start {
+        return false;
+    }
+    match source {
+        Some(source) if !source.mac.eq_ignore_ascii_case(local_mac) => match source.r#type {
+            AudioSourceType::Media => prefs.takeover_from_music,
+            AudioSourceType::Call => prefs.takeover_from_call,
+            AudioSourceType::None => true,
+        },
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audio::{CardSnapshot, ProfileSnapshot};
+    use crate::prefs::DevicePrefs;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -811,9 +895,96 @@ mod tests {
         }
     }
 
+    /// No preferences file: every device gets the defaults. Nothing in these tests writes one.
+    fn default_prefs() -> PrefsStore {
+        PrefsStore::new(std::path::PathBuf::from(
+            "/nonexistent/librepods-tests/preferences.json",
+        ))
+    }
+
     fn controller(backend: Arc<FakeBackend>) -> MediaController {
-        MediaController::new(MAC.to_string(), "B0:60:88:AF:DD:DA".to_string(), backend)
-            .with_a2dp_wait(3, Duration::from_millis(1))
+        MediaController::new(
+            MAC.to_string(),
+            "B0:60:88:AF:DD:DA".to_string(),
+            backend,
+            default_prefs(),
+        )
+        .with_a2dp_wait(3, Duration::from_millis(1))
+    }
+
+    #[test]
+    fn conversation_ducks_to_absolute_cap() {
+        use ConversationAction::*;
+        let prefs = DevicePrefs::default();
+        assert_eq!(conversation_action(1, 60, &prefs), Duck(25));
+        assert_eq!(conversation_action(2, 60, &prefs), Duck(15));
+        assert_eq!(conversation_action(3, 60, &prefs), Duck(25));
+        assert_eq!(conversation_action(1, 10, &prefs), Duck(10));
+        for level in [4, 6, 7, 8, 9] {
+            assert_eq!(conversation_action(level, 60, &prefs), Restore, "level {level}");
+        }
+        assert_eq!(conversation_action(5, 60, &prefs), Nothing);
+        assert_eq!(conversation_action(0, 60, &prefs), Nothing);
+    }
+
+    #[test]
+    fn conversation_relative_scales_original() {
+        use ConversationAction::*;
+        let prefs = DevicePrefs {
+            conversation_relative: true,
+            conversation_volume: 50,
+            conversation_reduced_volume: 20,
+            ..DevicePrefs::default()
+        };
+        assert_eq!(conversation_action(1, 80, &prefs), Duck(40));
+        assert_eq!(conversation_action(2, 80, &prefs), Duck(16));
+        assert_eq!(conversation_action(3, 80, &prefs), Duck(40));
+    }
+
+    #[test]
+    fn conversation_pause_mode() {
+        use ConversationAction::*;
+        let prefs = DevicePrefs {
+            conversation_pause_music: true,
+            ..DevicePrefs::default()
+        };
+        assert_eq!(conversation_action(1, 60, &prefs), Pause);
+        assert_eq!(conversation_action(2, 60, &prefs), Nothing);
+        assert_eq!(conversation_action(3, 60, &prefs), Nothing);
+        assert_eq!(conversation_action(6, 60, &prefs), Resume);
+        assert_eq!(conversation_action(9, 60, &prefs), Resume);
+    }
+
+    #[test]
+    fn takeover_respects_audio_source() {
+        use crate::bluetooth::aacp::{AudioSource, AudioSourceType};
+        const LOCAL: &str = "B0:60:88:AF:DD:DA";
+        const PHONE: &str = "AA:BB:CC:DD:EE:FF";
+        let source = |mac: &str, r#type| AudioSource { mac: mac.to_string(), r#type };
+        let prefs = DevicePrefs::default();
+        assert!(takeover_allowed(&prefs, None, LOCAL, false));
+        assert!(takeover_allowed(&prefs, Some(&source(PHONE, AudioSourceType::Media)), LOCAL, false));
+        assert!(!takeover_allowed(&prefs, Some(&source(PHONE, AudioSourceType::Call)), LOCAL, false));
+        assert!(takeover_allowed(&prefs, Some(&source(LOCAL, AudioSourceType::Call)), LOCAL, false));
+        assert!(takeover_allowed(&prefs, Some(&source(PHONE, AudioSourceType::None)), LOCAL, false));
+        assert!(!takeover_allowed(&prefs, None, LOCAL, true));
+
+        let off = DevicePrefs { takeover_on_media_start: false, ..DevicePrefs::default() };
+        assert!(!takeover_allowed(&off, None, LOCAL, false));
+        let keep_music = DevicePrefs { takeover_from_music: false, ..DevicePrefs::default() };
+        assert!(!takeover_allowed(&keep_music, Some(&source(PHONE, AudioSourceType::Media)), LOCAL, false));
+        let calls_too = DevicePrefs { takeover_from_call: true, ..DevicePrefs::default() };
+        assert!(takeover_allowed(&calls_too, Some(&source(PHONE, AudioSourceType::Call)), LOCAL, false));
+    }
+
+    #[tokio::test]
+    async fn takeover_suppression_expires() {
+        let mc = controller(backend_with(vec![]));
+        assert!(!mc.takeover_suppressed().await);
+        mc.suppress_takeover(Duration::from_millis(50)).await;
+        assert!(mc.takeover_suppressed().await);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!mc.takeover_suppressed().await);
     }
 
     fn backend_with(cards: Vec<CardSnapshot>) -> Arc<FakeBackend> {
@@ -927,6 +1098,7 @@ mod tests {
                 STALE_MAC.to_string(),
                 "B0:60:88:AF:DD:DA".to_string(),
                 backend.clone(),
+                default_prefs(),
             )
             .with_a2dp_wait(3, Duration::from_millis(1))
         };
