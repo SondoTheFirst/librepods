@@ -1,3 +1,4 @@
+use crate::audio::SystemAudioBackend;
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
 use crate::media_controller::MediaController;
@@ -121,6 +122,7 @@ impl AirPodsDevice {
         let media_controller = Arc::new(Mutex::new(MediaController::new(
             mac_address.to_string(),
             local_mac.clone(),
+            Arc::new(SystemAudioBackend),
         )));
         let mc_clone = media_controller.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
