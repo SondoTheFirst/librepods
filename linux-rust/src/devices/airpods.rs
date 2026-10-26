@@ -1,6 +1,7 @@
 use crate::audio::SystemAudioBackend;
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
+use crate::devices::registry::ManagedDevice;
 use crate::media_controller::MediaController;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
@@ -9,6 +10,7 @@ use ksni::Handle;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 use crate::utils::get_app_settings_path;
 
@@ -18,6 +20,8 @@ pub struct AirPodsDevice {
     // pub att_manager: ATTManager,
     pub media_controller: MediaController,
     // pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>>,
+    /// Every background loop of this instance; aborted on shutdown.
+    tasks: JoinSet<()>,
 }
 
 impl AirPodsDevice {
@@ -25,10 +29,13 @@ impl AirPodsDevice {
         mac_address: Address,
         tray_handle: Option<Handle<MyTray>>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
-    ) -> Self {
+    ) -> Option<Self> {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
-        aacp_manager.connect(mac_address).await;
+        if !aacp_manager.connect(mac_address).await {
+            error!("Could not open the AACP channel to {}", mac_address);
+            return None;
+        }
 
         // let mut att_manager = ATTManager::new();
         // att_manager.connect(mac_address).await.expect("Failed to connect ATT");
@@ -105,18 +112,14 @@ impl AirPodsDevice {
             }
         }
 
-        let session = bluer::Session::new()
-            .await
-            .expect("Failed to get bluer session");
-        let adapter = session
-            .default_adapter()
-            .await
-            .expect("Failed to get default adapter");
-        let local_mac = adapter
-            .address()
-            .await
-            .expect("Failed to get adapter address")
-            .to_string();
+        let local_mac = match local_adapter_address().await {
+            Ok(address) => address.to_string(),
+            Err(e) => {
+                error!("Failed to get the local Bluetooth adapter address: {}", e);
+                aacp_manager.disconnect().await;
+                return None;
+            }
+        };
 
         let media_controller = MediaController::new(
             mac_address.to_string(),
@@ -134,8 +137,9 @@ impl AirPodsDevice {
                 .await;
         }
 
+        let mut tasks = JoinSet::new();
         let aacp_manager_clone = aacp_manager.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some((id, value)) = command_rx.recv().await {
                 if let Err(e) = aacp_manager_clone.send_control_command(id, &value).await {
                     log::error!("Failed to send control command: {}", e);
@@ -143,7 +147,7 @@ impl AirPodsDevice {
             }
         });
 
-        tokio::spawn(
+        tasks.spawn(
             media_controller
                 .clone()
                 .run_playback_listener(aacp_manager.clone(), command_tx.clone()),
@@ -157,7 +161,7 @@ impl AirPodsDevice {
             )
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some(value) = listening_mode_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
@@ -174,7 +178,7 @@ impl AirPodsDevice {
             .subscribe_to_control_command(ControlCommandIdentifiers::AllowOffOption, allow_off_tx)
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some(value) = allow_off_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
@@ -195,7 +199,7 @@ impl AirPodsDevice {
             )
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some(value) = conversation_detect_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
@@ -215,7 +219,7 @@ impl AirPodsDevice {
             )
             .await;
         let mc_clone_owns = media_controller.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some(value) = owns_connection_rx.recv().await {
                 let owns = value.first().copied().unwrap_or(0) != 0;
                 if !owns {
@@ -230,7 +234,7 @@ impl AirPodsDevice {
         let local_mac_events = local_mac.clone();
         let ui_tx_clone = ui_tx.clone();
         let command_tx_clone = command_tx.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some(event) = rx.recv().await {
                 let event_clone = event.clone();
                 match event {
@@ -383,12 +387,34 @@ impl AirPodsDevice {
             }
         });
 
-        AirPodsDevice {
+        Some(AirPodsDevice {
             mac_address,
             aacp_manager,
             // att_manager,
             media_controller,
             // command_tx: Some(command_tx.clone()),
+            tasks,
+        })
+    }
+}
+
+async fn local_adapter_address() -> bluer::Result<Address> {
+    let session = bluer::Session::new().await?;
+    let adapter = session.default_adapter().await?;
+    adapter.address().await
+}
+
+impl ManagedDevice for AirPodsDevice {
+    fn is_alive(&self) -> bool {
+        self.aacp_manager.is_connected()
+    }
+
+    fn shutdown(mut self) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            info!("Shutting down AirPodsDevice for {}", self.mac_address);
+            self.tasks.abort_all();
+            while self.tasks.join_next().await.is_some() {}
+            self.aacp_manager.disconnect().await;
         }
     }
 }

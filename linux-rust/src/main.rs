@@ -9,6 +9,7 @@ use crate::bluetooth::discovery::{find_connected_airpods, find_other_managed_dev
 use crate::bluetooth::le::start_le_monitor;
 use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::DeviceData;
+use crate::devices::registry::DeviceRegistry;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
 use crate::utils::{get_app_settings_path, get_devices_path};
@@ -162,6 +163,8 @@ async fn async_main(
         }
     });
 
+    let airpods: DeviceRegistry<AirPodsDevice> = DeviceRegistry::new();
+
     info!("Listening for new connections.");
 
     info!("Checking for connected devices...");
@@ -172,22 +175,14 @@ async fn async_main(
                 .await?
                 .unwrap_or_else(|| "Unknown".to_string());
             info!("Found connected AirPods: {}, initializing.", name);
-            let airpods_device =
-                AirPodsDevice::new(device.address(), tray_handle.clone(), ui_tx.clone()).await;
-
-            let mut managers = device_managers.write().await;
-            // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
-            let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
-            managers
-                .entry(device.address().to_string())
-                .or_insert(dev_managers)
-                .set_aacp(airpods_device.aacp_manager);
-            drop(managers);
-            if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceConnected(
-                device.address().to_string(),
-            )) {
-                warn!("Failed to send DeviceConnected UI message: {:?}", e);
-            }
+            connect_airpods(
+                airpods.clone(),
+                device.address(),
+                tray_handle.clone(),
+                ui_tx.clone(),
+                device_managers.clone(),
+            )
+            .await;
         }
         Err(_) => {
             info!("No connected AirPods found.");
@@ -202,7 +197,11 @@ async fn async_main(
                     "Found connected managed device: {}, initializing.",
                     addr_str
                 );
-                let type_ = devices_list.get(&addr_str).unwrap().type_.clone();
+                let Some(device_data) = devices_list.get(&addr_str) else {
+                    warn!("No saved entry for managed device {}, skipping", addr_str);
+                    continue;
+                };
+                let type_ = device_data.type_.clone();
                 let ui_tx_clone = ui_tx.clone();
                 let device_managers = device_managers.clone();
                 tokio::spawn(async move {
@@ -274,15 +273,24 @@ async fn async_main(
         let Ok(addr) = addr_str.parse::<Address>() else {
             return true;
         };
-        if is_connected==0 {
+        if is_connected == 0 {
             if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceDisconnected(addr_str.clone())) {
-                warn!("Failed to send DeviceConnected UI message: {:?}", e);
+                warn!("Failed to send DeviceDisconnected UI message: {:?}", e);
             }
-            return true
+            tokio::spawn(disconnect_airpods(
+                airpods.clone(),
+                addr_str.clone(),
+                tray_handle.clone(),
+            ));
+            return true;
         }
         if managed_devices_mac.contains(&addr_str) {
             info!("Managed device connected: {}, initializing", addr_str);
-            let type_ = devices_list.get(&addr_str).unwrap().type_.clone();
+            let Some(device_data) = devices_list.get(&addr_str) else {
+                warn!("No saved entry for managed device {}, skipping", addr_str);
+                return true;
+            };
+            let type_ = device_data.type_.clone();
             if type_ == devices::enums::DeviceType::Nothing {
                 let ui_tx_clone = ui_tx.clone();
                 let device_managers = device_managers.clone();
@@ -310,28 +318,73 @@ async fn async_main(
             .get::<String>("org.bluez.Device1", "Name")
             .unwrap_or_else(|_| "Unknown".to_string());
         info!("AirPods connected: {}, initializing", name);
-        let handle_clone = tray_handle.clone();
-        let ui_tx_clone = ui_tx.clone();
-        let device_managers = device_managers.clone();
-        tokio::spawn(async move {
-            let airpods_device = AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await;
-            let mut managers = device_managers.write().await;
-            // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
-            let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());
-            managers
-                .entry(addr_str.clone())
-                .or_insert(dev_managers)
-                .set_aacp(airpods_device.aacp_manager);
-            drop(managers);
-            if let Err(e) = ui_tx_clone.send(BluetoothUIMessage::DeviceConnected(addr_str.clone())) {
-                warn!("Failed to send DeviceConnected UI message: {:?}", e);
-            }
-        });
+        tokio::spawn(connect_airpods(
+            airpods.clone(),
+            addr,
+            tray_handle.clone(),
+            ui_tx.clone(),
+            device_managers.clone(),
+        ));
         true
     })?;
 
     info!("Listening for Bluetooth connections via D-Bus...");
     loop {
         conn.process(std::time::Duration::from_millis(1000))?;
+    }
+}
+
+/// Brings up the single AirPods instance for `addr`, unless one is already live or connecting.
+async fn connect_airpods(
+    registry: DeviceRegistry<AirPodsDevice>,
+    addr: Address,
+    tray_handle: Option<ksni::Handle<MyTray>>,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
+    device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
+) {
+    let mac = addr.to_string();
+    let addr_str = mac.clone();
+    registry
+        .connect_with(&mac, move || async move {
+            let device = AirPodsDevice::new(addr, tray_handle, ui_tx.clone()).await?;
+            let mut managers = device_managers.write().await;
+            // let dev_managers = DeviceManagers::with_both(device.aacp_manager.clone(), device.att_manager.clone());
+            managers
+                .entry(addr_str.clone())
+                .or_insert_with(|| DeviceManagers::with_aacp(device.aacp_manager.clone()))
+                .set_aacp(device.aacp_manager.clone());
+            drop(managers);
+            if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceConnected(addr_str)) {
+                warn!("Failed to send DeviceConnected UI message: {:?}", e);
+            }
+            Some(device)
+        })
+        .await;
+}
+
+/// Tears down the AirPods instance for `mac` and clears its state from the tray.
+async fn disconnect_airpods(
+    registry: DeviceRegistry<AirPodsDevice>,
+    mac: String,
+    tray_handle: Option<ksni::Handle<MyTray>>,
+) {
+    if !registry.disconnect(&mac).await {
+        return;
+    }
+    if let Some(handle) = tray_handle {
+        handle
+            .update(|tray: &mut MyTray| {
+                tray.connected = false;
+                tray.battery_headphone = None;
+                tray.battery_headphone_status = None;
+                tray.battery_l = None;
+                tray.battery_l_status = None;
+                tray.battery_r = None;
+                tray.battery_r_status = None;
+                tray.battery_c = None;
+                tray.battery_c_status = None;
+                tray.listening_mode = None;
+            })
+            .await;
     }
 }
