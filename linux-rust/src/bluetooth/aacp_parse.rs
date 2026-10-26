@@ -172,6 +172,99 @@ pub fn ear_left_right(
     }
 }
 
+/// The three-band custom EQ (opcode 0x63). Bands run 0–100; 50 is flat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustomEq {
+    pub enabled: bool,
+    pub low: u8,
+    pub mid: u8,
+    pub high: u8,
+}
+
+/// The 0x63 body: `05 00 01 [state: 02 on, 01 off] low mid high`.
+pub fn custom_eq_payload(eq: CustomEq) -> [u8; 7] {
+    [
+        0x05,
+        0x00,
+        0x01,
+        if eq.enabled { 0x02 } else { 0x01 },
+        eq.low.min(100),
+        eq.mid.min(100),
+        eq.high.min(100),
+    ]
+}
+
+pub fn parse_custom_eq(payload: &[u8]) -> Option<CustomEq> {
+    if payload.get(2) != Some(&0x05) {
+        return None;
+    }
+    let enabled = match payload.get(5)? {
+        0x02 => true,
+        0x01 => false,
+        _ => return None,
+    };
+    let [low, mid, high] = <[u8; 3]>::try_from(payload.get(6..9)?).ok()?;
+    if [low, mid, high].iter().any(|&band| band > 100) {
+        return None;
+    }
+    Some(CustomEq { enabled, low, mid, high })
+}
+
+/// Headphone accommodation (opcode 0x53): an 8-band EQ (0–100) applied to phone calls and/or
+/// media.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Accommodation {
+    pub phone: bool,
+    pub media: bool,
+    pub bands: [f32; 8],
+}
+
+const ACCOMMODATION_TAG: u8 = 0x84;
+/// `53 00` + tag, `00 02 02`, phone, media, and the bands four times as f32.
+const ACCOMMODATION_PAYLOAD_LEN: usize = 2 + 6 + 4 * 8 * 4;
+
+/// The 0x53 body: `84 00 02 02 [phone 01/02] [media 01/02]`, then the 8 bands as little-endian
+/// f32, repeated four times (the AirPods expect all four copies).
+pub fn accommodation_payload(a: &Accommodation) -> Vec<u8> {
+    let flag = |on: bool| if on { 0x01 } else { 0x02 };
+    let mut payload = vec![ACCOMMODATION_TAG, 0x00, 0x02, 0x02, flag(a.phone), flag(a.media)];
+    for _ in 0..4 {
+        for band in a.bands {
+            let band = if band.is_nan() { 0.0 } else { band.clamp(0.0, 100.0) };
+            payload.extend_from_slice(&band.to_le_bytes());
+        }
+    }
+    payload
+}
+
+/// Reads phone then media, the same order the app sends them in.
+pub fn parse_accommodation(payload: &[u8]) -> Option<Accommodation> {
+    if payload.len() != ACCOMMODATION_PAYLOAD_LEN || payload.get(2) != Some(&ACCOMMODATION_TAG) {
+        return None;
+    }
+    let flag = |byte: u8| byte == 0x01;
+    let phone = flag(*payload.get(6)?);
+    let media = flag(*payload.get(7)?);
+    let mut bands = [0f32; 8];
+    for (band, bytes) in bands.iter_mut().zip(payload.get(8..40)?.chunks_exact(4)) {
+        *band = f32::from_le_bytes(bytes.try_into().ok()?);
+    }
+    Some(Accommodation { phone, media, bands })
+}
+
+/// The rename body: `01 [length] 00 [UTF-8 name]`. `None` for an empty name or one longer than
+/// the one-byte length allows.
+pub fn rename_payload(name: &str) -> Option<Vec<u8>> {
+    let name = name.trim();
+    let length = u8::try_from(name.len()).ok()?;
+    if length == 0 {
+        return None;
+    }
+    let mut payload = vec![0x01, length, 0x00];
+    payload.extend_from_slice(name.as_bytes());
+    Some(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +422,100 @@ mod tests {
         );
     }
 
+    fn custom_eq_fixture() -> Vec<u8> {
+        hex("63 00 05 00 01 02 1E 32 46")
+    }
+
+    fn accommodation(phone: bool, media: bool) -> Accommodation {
+        let mut bands = [50.0; 8];
+        bands[0] = 25.0;
+        bands[7] = 100.0;
+        Accommodation { phone, media, bands }
+    }
+
+    fn accommodation_fixture() -> Vec<u8> {
+        let mut payload = hex("53 00");
+        payload.extend(accommodation_payload(&accommodation(true, false)));
+        payload
+    }
+
+    #[test]
+    fn custom_eq_round_trip() {
+        let eq = CustomEq { enabled: true, low: 30, mid: 50, high: 70 };
+        assert_eq!(custom_eq_payload(eq), [0x05, 0x00, 0x01, 0x02, 30, 50, 70]);
+        let mut payload = hex("63 00");
+        payload.extend(custom_eq_payload(eq));
+        assert_eq!(parse_custom_eq(&payload), Some(eq));
+
+        let off = CustomEq { enabled: false, low: 50, mid: 50, high: 50 };
+        assert_eq!(custom_eq_payload(off), [0x05, 0x00, 0x01, 0x01, 50, 50, 50]);
+        assert_eq!(parse_custom_eq(&custom_eq_fixture()), Some(CustomEq { enabled: true, low: 30, mid: 50, high: 70 }));
+    }
+
+    #[test]
+    fn custom_eq_clamps_and_rejects() {
+        let loud = CustomEq { enabled: true, low: 150, mid: 50, high: 255 };
+        assert_eq!(custom_eq_payload(loud), [0x05, 0x00, 0x01, 0x02, 100, 50, 100]);
+        assert_eq!(parse_custom_eq(&hex("63 00 04 00 01 02 1E 32 46")), None);
+        assert_eq!(parse_custom_eq(&hex("63 00 05 00 01 02 65 32 46")), None);
+        assert_eq!(parse_custom_eq(&hex("63 00 05 00 01 03 1E 32 46")), None);
+    }
+
+    #[test]
+    fn accommodation_layout() {
+        let payload = accommodation_payload(&accommodation(true, false));
+        assert_eq!(payload.len(), 134);
+        assert_eq!(payload[..6], [0x84, 0x00, 0x02, 0x02, 0x01, 0x02]);
+        assert_eq!(payload[6..10], 25f32.to_le_bytes());
+        assert_eq!(payload[34..38], 100f32.to_le_bytes());
+        assert_eq!(payload[6..38], payload[38..70]);
+        assert_eq!(payload[38..70], payload[70..102]);
+        assert_eq!(payload[70..102], payload[102..134]);
+
+        let mut wild = accommodation(false, true);
+        wild.bands[1] = 250.0;
+        wild.bands[2] = -3.0;
+        let payload = accommodation_payload(&wild);
+        assert_eq!(payload[4..6], [0x02, 0x01]);
+        assert_eq!(payload[10..14], 100f32.to_le_bytes());
+        assert_eq!(payload[14..18], 0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn accommodation_keeps_phone_media_order() {
+        assert_eq!(
+            parse_accommodation(&accommodation_fixture()),
+            Some(accommodation(true, false))
+        );
+    }
+
+    #[test]
+    fn accommodation_rejects_wrong_size_or_tag() {
+        let fixture = accommodation_fixture();
+        assert_eq!(parse_accommodation(&fixture[..135]), None);
+        let mut wrong_tag = fixture.clone();
+        wrong_tag[2] = 0x85;
+        assert_eq!(parse_accommodation(&wrong_tag), None);
+        let mut longer = fixture;
+        longer.push(0);
+        assert_eq!(parse_accommodation(&longer), None);
+    }
+
+    #[test]
+    fn rename_payload_rules() {
+        let name = "Logan’s AirPods";
+        let mut expected = vec![0x01, 17, 0x00];
+        expected.extend_from_slice(name.as_bytes());
+        assert_eq!(rename_payload(name), Some(expected));
+        assert_eq!(rename_payload("  x  "), Some(vec![0x01, 0x01, 0x00, b'x']));
+        assert_eq!(rename_payload(""), None);
+        assert_eq!(rename_payload("   "), None);
+        assert_eq!(rename_payload(&"a".repeat(256)), None);
+        let longest = rename_payload(&"a".repeat(255)).unwrap();
+        assert_eq!(longest[1], 255);
+        assert_eq!(longest.len(), 3 + 255);
+    }
+
     #[test]
     fn no_parser_panics_on_truncation() {
         let fixtures: Vec<(Vec<u8>, fn(&[u8]))> = vec![
@@ -352,6 +539,12 @@ mod tests {
             }),
             (capabilities_fixture(), |p| {
                 let _ = parse_capabilities(p);
+            }),
+            (custom_eq_fixture(), |p| {
+                let _ = parse_custom_eq(p);
+            }),
+            (accommodation_fixture(), |p| {
+                let _ = parse_accommodation(p);
             }),
         ];
         for (fixture, parse) in fixtures {
