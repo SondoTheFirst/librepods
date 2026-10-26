@@ -1,4 +1,4 @@
-use crate::devices::airpods::AirPodsInformation;
+use crate::bluetooth::aacp_parse;
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::utils::get_devices_path;
 use bluer::{
@@ -249,9 +249,11 @@ pub enum BatteryComponent {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryStatus {
+    Unknown = 0,
     Charging = 1,
     NotCharging = 2,
     Disconnected = 4,
+    OptimizedCharging = 5,
 }
 
 #[repr(u8)]
@@ -512,44 +514,10 @@ impl AACPManager {
 
         match opcode {
             opcodes::BATTERY_INFO => {
-                if payload.len() < 3 {
-                    error!("Battery Info packet too short: {}", hex::encode(payload));
+                let Some(batteries) = aacp_parse::parse_battery(payload) else {
+                    error!("Malformed Battery Info packet: {}", hex::encode(payload));
                     return;
-                }
-                let count = payload[2] as usize;
-                if payload.len() < 3 + count * 5 {
-                    error!(
-                        "Battery Info packet length mismatch: {}",
-                        hex::encode(payload)
-                    );
-                    return;
-                }
-                let mut batteries = Vec::with_capacity(count);
-                for i in 0..count {
-                    let base_index = 3 + i * 5;
-                    batteries.push(BatteryInfo {
-                        component: match payload[base_index] {
-                            0x01 => BatteryComponent::Headphone,
-                            0x02 => BatteryComponent::Right,
-                            0x04 => BatteryComponent::Left,
-                            0x08 => BatteryComponent::Case,
-                            _ => {
-                                error!("Unknown battery component: {:#04x}", payload[base_index]);
-                                continue;
-                            }
-                        },
-                        level: payload[base_index + 2],
-                        status: match payload[base_index + 3] {
-                            0x01 => BatteryStatus::Charging,
-                            0x02 => BatteryStatus::NotCharging,
-                            0x04 => BatteryStatus::Disconnected,
-                            _ => {
-                                error!("Unknown battery status: {:#04x}", payload[base_index + 3]);
-                                continue;
-                            }
-                        },
-                    });
-                }
+                };
                 let mut state = self.state.lock().await;
                 state.battery_info = batteries.clone();
                 if let Some(ref tx) = state.event_tx {
@@ -610,29 +578,11 @@ impl AACPManager {
                 }
             }
             opcodes::EAR_DETECTION => {
-                let primary_status = packet[6];
-                let secondary_status = packet[7];
-                let mut statuses = Vec::new();
-                statuses.push(match primary_status {
-                    0x00 => EarDetectionStatus::InEar,
-                    0x01 => EarDetectionStatus::OutOfEar,
-                    0x02 => EarDetectionStatus::InCase,
-                    0x03 => EarDetectionStatus::Disconnected,
-                    _ => {
-                        error!("Unknown ear detection status: {:#04x}", primary_status);
-                        EarDetectionStatus::OutOfEar
-                    }
-                });
-                statuses.push(match secondary_status {
-                    0x00 => EarDetectionStatus::InEar,
-                    0x01 => EarDetectionStatus::OutOfEar,
-                    0x02 => EarDetectionStatus::InCase,
-                    0x03 => EarDetectionStatus::Disconnected,
-                    _ => {
-                        error!("Unknown ear detection status: {:#04x}", secondary_status);
-                        EarDetectionStatus::OutOfEar
-                    }
-                });
+                let Some(statuses) = aacp_parse::parse_ear_detection(payload) else {
+                    error!("Malformed Ear Detection packet: {}", hex::encode(payload));
+                    return;
+                };
+                let statuses = statuses.to_vec();
                 let mut state = self.state.lock().await;
                 state.old_ear_detection_status = state.ear_detection_status.clone();
                 state.ear_detection_status = statuses.clone();
@@ -669,49 +619,9 @@ impl AACPManager {
                 }
             }
             opcodes::INFORMATION => {
-                if payload.len() < 6 {
-                    error!("Information packet too short: {}", hex::encode(payload));
+                let Some(info) = aacp_parse::parse_information(payload) else {
+                    error!("Malformed Information packet: {}", hex::encode(payload));
                     return;
-                }
-                let data = &payload[4..];
-                let mut index = 0;
-                while index < data.len() && data[index] != 0x00 {
-                    index += 1;
-                }
-                let mut strings = Vec::new();
-                while index < data.len() {
-                    while index < data.len() && data[index] == 0x00 {
-                        index += 1;
-                    }
-                    if index >= data.len() {
-                        break;
-                    }
-                    let start = index;
-                    while index < data.len() && data[index] != 0x00 {
-                        index += 1;
-                    }
-                    let str_bytes = &data[start..index];
-                    if let Ok(s) = std::str::from_utf8(str_bytes) {
-                        strings.push(s.to_string());
-                    }
-                }
-                strings.remove(0);
-                let info = AirPodsInformation {
-                    name: strings.first().cloned().unwrap_or_default(),
-                    model_number: strings.get(1).cloned().unwrap_or_default(),
-                    manufacturer: strings.get(2).cloned().unwrap_or_default(),
-                    serial_number: strings.get(3).cloned().unwrap_or_default(),
-                    version1: strings.get(4).cloned().unwrap_or_default(),
-                    version2: strings.get(5).cloned().unwrap_or_default(),
-                    hardware_revision: strings.get(6).cloned().unwrap_or_default(),
-                    updater_identifier: strings.get(7).cloned().unwrap_or_default(),
-                    left_serial_number: strings.get(8).cloned().unwrap_or_default(),
-                    right_serial_number: strings.get(9).cloned().unwrap_or_default(),
-                    version3: strings.get(10).cloned().unwrap_or_default(),
-                    le_keys: AirPodsLEKeys {
-                        irk: "".to_string(),
-                        enc_key: "".to_string(),
-                    },
                 };
                 let mut state = self.state.lock().await;
                 if let Some(mac) = state.airpods_mac
@@ -857,42 +767,10 @@ impl AACPManager {
                 info!("Received Audio Source: {:?}", state.audio_source);
             }
             opcodes::CONNECTED_DEVICES => {
-                if payload.len() < 3 {
-                    error!(
-                        "Connected Devices packet too short: {}",
-                        hex::encode(payload)
-                    );
+                let Some(devices) = aacp_parse::parse_connected_devices(payload) else {
+                    error!("Malformed Connected Devices packet: {}", hex::encode(payload));
                     return;
-                }
-                let count = payload[2] as usize;
-                if payload.len() < 3 + count * 8 {
-                    error!(
-                        "Connected Devices packet length mismatch: {}",
-                        hex::encode(payload)
-                    );
-                    return;
-                }
-                let mut devices = Vec::with_capacity(count);
-                for i in 0..count {
-                    let base = 5 + i * 8;
-                    let mac = format!(
-                        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                        payload[base],
-                        payload[base + 1],
-                        payload[base + 2],
-                        payload[base + 3],
-                        payload[base + 4],
-                        payload[base + 5]
-                    );
-                    let info1 = payload[base + 6];
-                    let info2 = payload[base + 7];
-                    devices.push(ConnectedDevice {
-                        mac,
-                        info1,
-                        info2,
-                        r#type: None,
-                    });
-                }
+                };
                 let mut state = self.state.lock().await;
                 state.old_connected_devices = state.connected_devices.clone();
                 state.connected_devices = devices.clone();
@@ -905,7 +783,10 @@ impl AACPManager {
                 info!("Received Connected Devices: {:?}", state.connected_devices);
             }
             opcodes::SMART_ROUTING_RESP => {
-                let packet_string = String::from_utf8_lossy(&payload[2..]);
+                let Some(packet_string) = aacp_parse::parse_smart_routing_response(payload) else {
+                    error!("Malformed Smart Routing Response: {}", hex::encode(payload));
+                    return;
+                };
                 info!("Received Smart Routing Response: {}", packet_string);
                 if packet_string.contains("SetOwnershipToFalse") {
                     info!("Received OwnershipToFalse request");
