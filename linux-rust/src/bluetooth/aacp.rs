@@ -9,6 +9,7 @@ use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
@@ -356,6 +357,7 @@ impl AACPManagerState {
 pub struct AACPManager {
     pub state: Arc<Mutex<AACPManagerState>>,
     tasks: Arc<Mutex<JoinSet<()>>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl AACPManager {
@@ -363,10 +365,26 @@ impl AACPManager {
         AACPManager {
             state: Arc::new(Mutex::new(AACPManagerState::new())),
             tasks: Arc::new(Mutex::new(JoinSet::new())),
+            connected: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub async fn connect(&mut self, addr: Address) {
+    /// Whether the L2CAP channel is up and its receive loop is still running.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    /// Stops the send/receive loops and drops the channel.
+    pub async fn disconnect(&self) {
+        let mut tasks = self.tasks.lock().await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        drop(tasks);
+        self.state.lock().await.sender = None;
+        self.connected.store(false, Ordering::SeqCst);
+    }
+
+    pub async fn connect(&mut self, addr: Address) -> bool {
         info!("AACPManager connecting to {} on PSM {:#06X}...", addr, PSM);
         let target_sa = SocketAddr::new(addr, AddressType::BrEdr, PSM);
 
@@ -379,7 +397,7 @@ impl AACPManager {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to create L2CAP socket: {}", e);
-                return;
+                return false;
             }
         };
 
@@ -388,11 +406,11 @@ impl AACPManager {
                 Ok(Ok(s)) => Arc::new(s),
                 Ok(Err(e)) => {
                     error!("L2CAP connect failed: {}", e);
-                    return;
+                    return false;
                 }
                 Err(_) => {
                     error!("L2CAP connect timed out");
-                    return;
+                    return false;
                 }
             };
 
@@ -406,14 +424,14 @@ impl AACPManager {
                     if e.raw_os_error() == Some(107) {
                         // ENOTCONN
                         error!("Peer has disconnected during connection setup.");
-                        return;
+                        return false;
                     }
                     error!("Error getting peer address: {}", e);
                 }
             }
             if start.elapsed() >= CONNECT_TIMEOUT {
                 error!("Timed out waiting for L2CAP connection to be fully established.");
-                return;
+                return false;
             }
             sleep(POLL_INTERVAL).await;
         }
@@ -428,9 +446,11 @@ impl AACPManager {
             state.sender = Some(tx);
         }
 
+        self.connected.store(true, Ordering::SeqCst);
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(recv_thread(manager_clone, seq_packet.clone()));
         tasks.spawn(send_thread(rx, seq_packet));
+        true
     }
 
     async fn send_packet(&self, data: &[u8]) -> Result<()> {
@@ -1079,6 +1099,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
     }
     let mut state = manager.state.lock().await;
     state.sender = None;
+    manager.connected.store(false, Ordering::SeqCst);
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
