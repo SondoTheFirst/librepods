@@ -1,13 +1,12 @@
 use crate::bluetooth::aacp_parse;
-use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::utils::get_devices_path;
+use crate::devices::enums::DeviceData;
+use crate::utils::{apply_information, apply_le_key, get_devices_path, update_devices_file};
 use bluer::{
     Address, AddressType, Error, Result,
     l2cap::{SeqPacket, Socket, SocketAddr},
 };
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -310,7 +309,7 @@ pub enum AACPEvent {
     StemPress(StemPressType, StemPressBudType),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AirPodsLEKeys {
     pub irk: String,
     pub enc_key: String,
@@ -330,16 +329,11 @@ pub struct AACPManagerState {
     pub old_ear_detection_status: Vec<EarDetectionStatus>,
     pub ear_detection_status: Vec<EarDetectionStatus>,
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
-    pub devices: HashMap<String, DeviceData>,
     pub airpods_mac: Option<Address>,
 }
 
 impl AACPManagerState {
     fn new() -> Self {
-        let devices: HashMap<String, DeviceData> = std::fs::read_to_string(get_devices_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
         AACPManagerState {
             sender: None,
             control_command_status_list: Vec::new(),
@@ -353,7 +347,6 @@ impl AACPManagerState {
             old_ear_detection_status: Vec::new(),
             ear_detection_status: Vec::new(),
             event_tx: None,
-            devices,
             airpods_mac: None,
         }
     }
@@ -623,22 +616,10 @@ impl AACPManager {
                     error!("Malformed Information packet: {}", hex::encode(payload));
                     return;
                 };
-                let mut state = self.state.lock().await;
-                if let Some(mac) = state.airpods_mac
-                    && let Some(device_data) = state.devices.get_mut(&mac.to_string())
-                {
-                    device_data.name = info.name.clone();
-                    device_data.information = Some(DeviceInformation::AirPods(info.clone()));
-                }
-                let json = serde_json::to_string(&state.devices).unwrap();
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
+                let airpods_mac = self.state.lock().await.airpods_mac;
+                if let Some(mac) = airpods_mac {
+                    let info_clone = info.clone();
+                    persist_device(mac, move |d| apply_information(d, info_clone)).await;
                 }
                 info!("Received Information: {:?}", info);
             }
@@ -683,49 +664,20 @@ impl AACPManager {
                         .map(|(kt, kd)| (kt, hex::encode(kd)))
                         .collect::<Vec<_>>()
                 );
-                let mut state = self.state.lock().await;
-                for (key_type, key_data) in &keys {
-                    if let Some(kt) = ProximityKeyType::from_u8(*key_type)
-                        && let Some(mac) = state.airpods_mac
-                    {
-                        let mac_str = mac.to_string();
-                        let device_data =
-                            state.devices.entry(mac_str.clone()).or_insert(DeviceData {
-                                name: mac_str.clone(),
-                                type_: DeviceType::AirPods,
-                                information: None,
-                            });
-                        match kt {
-                            ProximityKeyType::Irk => match device_data.information.as_mut() {
-                                Some(DeviceInformation::AirPods(info)) => {
-                                    info.le_keys.irk = hex::encode(key_data);
-                                }
-                                _ => {
-                                    error!("Device information is not AirPods for adding LE IRK.");
-                                }
-                            },
-                            ProximityKeyType::EncKey => match device_data.information.as_mut() {
-                                Some(DeviceInformation::AirPods(info)) => {
-                                    info.le_keys.enc_key = hex::encode(key_data);
-                                }
-                                _ => {
-                                    error!(
-                                        "Device information is not AirPods for adding LE encryption key."
-                                    );
-                                }
-                            },
+                let airpods_mac = self.state.lock().await.airpods_mac;
+                if let Some(mac) = airpods_mac {
+                    let typed_keys: Vec<(ProximityKeyType, String)> = keys
+                        .iter()
+                        .filter_map(|(kt, kd)| {
+                            ProximityKeyType::from_u8(*kt).map(|kt| (kt, hex::encode(kd)))
+                        })
+                        .collect();
+                    persist_device(mac, move |d| {
+                        for (key_type, key_hex) in &typed_keys {
+                            apply_le_key(d, *key_type, key_hex);
                         }
-                    }
-                }
-                let json = serde_json::to_string(&state.devices).unwrap();
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
+                    })
+                    .await;
                 }
             }
             opcodes::STEM_PRESS => {
@@ -1080,6 +1032,19 @@ impl AACPManager {
     pub async fn send_some_packet(&self) -> Result<()> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
+    }
+}
+
+/// Applies `update` to this device's entry in devices.json off the async runtime.
+async fn persist_device(mac: Address, update: impl FnOnce(&mut DeviceData) + Send + 'static) {
+    let result = tokio::task::spawn_blocking(move || {
+        update_devices_file(&get_devices_path(), &mac.to_string(), update)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("Failed to save devices: {}", e),
+        Err(e) => error!("Failed to save devices: {}", e),
     }
 }
 
