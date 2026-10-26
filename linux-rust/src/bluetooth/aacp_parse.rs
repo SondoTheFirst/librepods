@@ -126,6 +126,52 @@ pub fn parse_smart_routing_response(payload: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(body).into_owned())
 }
 
+/// Which bud the AirPods report as primary (opcode 0x08). Ear-detection bytes come in
+/// primary/secondary order, so this decides which one is left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudRole {
+    LeftPrimary,
+    RightPrimary,
+    Headset,
+}
+
+pub fn parse_bud_role(payload: &[u8]) -> Option<BudRole> {
+    Some(match *payload.get(2)? {
+        0x01 => BudRole::LeftPrimary,
+        0x02 => BudRole::RightPrimary,
+        _ => BudRole::Headset,
+    })
+}
+
+/// Capabilities packet (opcode 0x02): `[count]{[id][value]}`, where a few ids carry 4-byte values.
+pub fn parse_capabilities(payload: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
+    let count = *payload.get(2)? as usize;
+    let mut offset = 3;
+    let mut capabilities = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = *payload.get(offset)?;
+        let width = if matches!(id, 0x03 | 0x04 | 0x06 | 0x07 | 0x30) { 4 } else { 1 };
+        let value = payload.get(offset + 1..offset + 1 + width)?.to_vec();
+        capabilities.push((id, value));
+        offset += 1 + width;
+    }
+    Some(capabilities)
+}
+
+/// Maps ear-detection statuses from primary/secondary order to (left, right).
+/// Without a known role, the left bud is assumed to be primary.
+pub fn ear_left_right(
+    statuses: [EarDetectionStatus; 2],
+    role: Option<BudRole>,
+) -> (EarDetectionStatus, EarDetectionStatus) {
+    let [primary, secondary] = statuses;
+    match role {
+        Some(BudRole::RightPrimary) => (secondary, primary),
+        Some(BudRole::Headset) => (primary, primary),
+        Some(BudRole::LeftPrimary) | None => (primary, secondary),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +287,49 @@ mod tests {
     }
 
     #[test]
+    fn bud_role_values() {
+        assert_eq!(parse_bud_role(&hex("08 00 01")), Some(BudRole::LeftPrimary));
+        assert_eq!(parse_bud_role(&hex("08 00 02")), Some(BudRole::RightPrimary));
+        assert_eq!(parse_bud_role(&hex("08 00 00")), Some(BudRole::Headset));
+        assert_eq!(parse_bud_role(&hex("08 00")), None);
+    }
+
+    fn capabilities_fixture() -> Vec<u8> {
+        hex("02 00 03 01 05 03 AA BB CC DD 21 01")
+    }
+
+    #[test]
+    fn capabilities_mixed_widths() {
+        assert_eq!(
+            parse_capabilities(&capabilities_fixture()),
+            Some(vec![
+                (0x01, vec![0x05]),
+                (0x03, vec![0xAA, 0xBB, 0xCC, 0xDD]),
+                (0x21, vec![0x01]),
+            ])
+        );
+    }
+
+    #[test]
+    fn capabilities_truncated_is_none() {
+        assert_eq!(parse_capabilities(&hex("02 00 02 01 05 03 AA")), None);
+    }
+
+    #[test]
+    fn ear_mapping_follows_bud_role() {
+        use EarDetectionStatus::*;
+        assert_eq!(
+            ear_left_right([InEar, OutOfEar], Some(BudRole::RightPrimary)),
+            (OutOfEar, InEar)
+        );
+        assert_eq!(ear_left_right([InEar, OutOfEar], None), (InEar, OutOfEar));
+        assert_eq!(
+            ear_left_right([InEar, OutOfEar], Some(BudRole::LeftPrimary)),
+            (InEar, OutOfEar)
+        );
+    }
+
+    #[test]
     fn no_parser_panics_on_truncation() {
         let fixtures: Vec<(Vec<u8>, fn(&[u8]))> = vec![
             (battery_fixture(), |p| {
@@ -257,6 +346,12 @@ mod tests {
             }),
             (smart_routing_fixture(), |p| {
                 let _ = parse_smart_routing_response(p);
+            }),
+            (hex("08 00 01"), |p| {
+                let _ = parse_bud_role(p);
+            }),
+            (capabilities_fixture(), |p| {
+                let _ = parse_capabilities(p);
             }),
         ];
         for (fixture, parse) in fixtures {
