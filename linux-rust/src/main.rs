@@ -5,6 +5,7 @@ mod media_controller;
 mod ui;
 mod utils;
 
+use crate::bluetooth::battery_provider::BatteryReporter;
 use crate::bluetooth::discovery::{find_connected_airpods, find_other_managed_devices};
 use crate::bluetooth::le::start_le_monitor;
 use crate::bluetooth::managers::DeviceManagers;
@@ -159,6 +160,7 @@ async fn async_main(
     // Whether any AirPods hold an AACP connection; the BLE scanner only scans actively when not.
     let (aacp_connected_tx, aacp_connected_rx) = tokio::sync::watch::channel(false);
     let aacp_connected = Arc::new(aacp_connected_tx);
+    let battery_reporter = BatteryReporter::register().await;
 
     info!("Listening for new connections.");
 
@@ -177,6 +179,7 @@ async fn async_main(
                 ui_tx.clone(),
                 device_managers.clone(),
                 aacp_connected.clone(),
+                battery_reporter.clone(),
             )
             .await;
         }
@@ -331,6 +334,7 @@ async fn async_main(
             ui_tx.clone(),
             device_managers.clone(),
             aacp_connected.clone(),
+            battery_reporter.clone(),
         ));
         true
     })?;
@@ -349,12 +353,14 @@ async fn connect_airpods(
     ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
     aacp_connected: Arc<tokio::sync::watch::Sender<bool>>,
+    battery_reporter: Option<BatteryReporter>,
 ) {
     let mac = addr.to_string();
     let addr_str = mac.clone();
     let registered = registry
         .connect_with(&mac, move || async move {
-            let device = AirPodsDevice::new(addr, tray_handle, ui_tx.clone()).await?;
+            let device =
+                AirPodsDevice::new(addr, tray_handle, ui_tx.clone(), battery_reporter).await?;
             let mut managers = device_managers.write().await;
             // let dev_managers = DeviceManagers::with_both(device.aacp_manager.clone(), device.att_manager.clone());
             managers
