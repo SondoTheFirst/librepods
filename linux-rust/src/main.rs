@@ -99,7 +99,7 @@ fn main() -> iced::Result {
 
     // A second launch (say, from the taskbar) shows the running LibrePods instead of starting
     // another instance that would compete for the same AirPods.
-    if control::hand_over_to_running_instance() {
+    if control::hand_over_to_running_instance(!args.start_minimized) {
         return Ok(());
     }
     migrate_app_settings();
