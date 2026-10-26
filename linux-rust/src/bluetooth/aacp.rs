@@ -1,4 +1,5 @@
 use crate::bluetooth::aacp_parse;
+use crate::devices::models::AirPodsModel;
 use crate::devices::enums::DeviceData;
 use crate::utils::{apply_information, apply_le_key, get_devices_path, update_devices_file};
 use bluer::{
@@ -21,6 +22,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const HEADER_BYTES: [u8; 4] = [0x04, 0x00, 0x04, 0x00];
 
 pub mod opcodes {
+    pub const CAPABILITIES: u8 = 0x02;
+    pub const BUD_ROLE: u8 = 0x08;
     pub const SET_FEATURE_FLAGS: u8 = 0x4D;
     pub const REQUEST_NOTIFICATIONS: u8 = 0x0F;
     pub const BATTERY_INFO: u8 = 0x04;
@@ -464,6 +467,9 @@ pub struct AACPManagerState {
     pub conversational_awareness_status: u8,
     pub old_ear_detection_status: Vec<EarDetectionStatus>,
     pub ear_detection_status: Vec<EarDetectionStatus>,
+    pub bud_role: Option<aacp_parse::BudRole>,
+    pub capabilities: Vec<(u8, Vec<u8>)>,
+    pub model: Option<AirPodsModel>,
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub airpods_mac: Option<Address>,
 }
@@ -482,6 +488,9 @@ impl AACPManagerState {
             conversational_awareness_status: 0,
             old_ear_detection_status: Vec::new(),
             ear_detection_status: Vec::new(),
+            bud_role: None,
+            capabilities: Vec::new(),
+            model: None,
             event_tx: None,
             airpods_mac: None,
         }
@@ -731,6 +740,7 @@ impl AACPManager {
                     error!("Malformed Ear Detection packet: {}", hex::encode(payload));
                     return;
                 };
+                let pair = statuses;
                 let statuses = statuses.to_vec();
                 let mut state = self.state.lock().await;
                 state.old_ear_detection_status = state.ear_detection_status.clone();
@@ -746,9 +756,10 @@ impl AACPManager {
                         statuses,
                     ));
                 }
+                let (left, right) = aacp_parse::ear_left_right(pair, state.bud_role);
                 info!(
-                    "Received Ear Detection Status: {:?}",
-                    state.ear_detection_status
+                    "Received Ear Detection Status: {:?} (left: {:?}, right: {:?})",
+                    state.ear_detection_status, left, right
                 );
             }
             opcodes::CONVERSATION_AWARENESS => {
@@ -772,7 +783,20 @@ impl AACPManager {
                     error!("Malformed Information packet: {}", hex::encode(payload));
                     return;
                 };
-                let airpods_mac = self.state.lock().await.airpods_mac;
+                let model = AirPodsModel::from_model_number(&info.model_number);
+                let airpods_mac = {
+                    let mut state = self.state.lock().await;
+                    if state.model.is_none() {
+                        info!(
+                            "Detected {} ({}), capabilities: {:?}",
+                            model.display_name(),
+                            info.model_number,
+                            model.capabilities()
+                        );
+                    }
+                    state.model = Some(model);
+                    state.airpods_mac
+                };
                 if let Some(mac) = airpods_mac {
                     let info_clone = info.clone();
                     persist_device(mac, move |d| apply_information(d, info_clone)).await;
@@ -902,6 +926,25 @@ impl AACPManager {
                         let _ = tx.send(AACPEvent::OwnershipToFalseRequest);
                     }
                 }
+            }
+            opcodes::BUD_ROLE => {
+                let Some(role) = aacp_parse::parse_bud_role(payload) else {
+                    error!("Malformed Bud Role packet: {}", hex::encode(payload));
+                    return;
+                };
+                self.state.lock().await.bud_role = Some(role);
+                info!("Received Bud Role: {:?}", role);
+            }
+            opcodes::CAPABILITIES => {
+                let Some(capabilities) = aacp_parse::parse_capabilities(payload) else {
+                    error!("Malformed Capabilities packet: {}", hex::encode(payload));
+                    return;
+                };
+                info!(
+                    "Received Capabilities: {:02x?}",
+                    capabilities.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+                );
+                self.state.lock().await.capabilities = capabilities;
             }
             opcodes::EQ_DATA => {
                 debug!("Received EQ Data");
@@ -1240,6 +1283,9 @@ fn clear_connection_state(state: &mut AACPManagerState) {
     state.ear_detection_status.clear();
     state.old_ear_detection_status.clear();
     state.audio_source = None;
+    state.bud_role = None;
+    state.capabilities.clear();
+    state.model = None;
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
@@ -1291,6 +1337,18 @@ mod tests {
             .map(|id| *id as u8)
             .collect();
         assert_eq!(bytes.len(), ControlCommandIdentifiers::ALL.len());
+    }
+
+    #[test]
+    fn clearing_connection_state_forgets_model_and_role() {
+        let mut state = AACPManagerState::new();
+        state.model = Some(crate::devices::models::AirPodsModel::AirPodsPro1);
+        state.bud_role = Some(aacp_parse::BudRole::LeftPrimary);
+        state.capabilities = vec![(0x01, vec![0x05])];
+        clear_connection_state(&mut state);
+        assert!(state.model.is_none());
+        assert!(state.bud_role.is_none());
+        assert!(state.capabilities.is_empty());
     }
 
     #[test]
