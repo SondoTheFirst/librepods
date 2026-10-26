@@ -1,7 +1,7 @@
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::{ControlCommandIdentifiers, EarDetectionStatus};
 use crate::audio::{
-    A2dpAction, AudioBackend, find_bluez_card, get_sink_name_by_mac,
+    A2dpAction, AudioBackend, audio_lock_for, find_bluez_card, get_sink_name_by_mac,
     get_sink_volume_percent_by_name_sync, plan_a2dp_activation, transition_sink_volume,
 };
 use dbus::blocking::Connection;
@@ -47,7 +47,8 @@ impl MediaControllerState {
 pub struct MediaController {
     state: Arc<Mutex<MediaControllerState>>,
     backend: Arc<dyn AudioBackend>,
-    /// Serializes every card-profile change so concurrent triggers can't race each other.
+    /// Serializes every card-profile change for this MAC, across all instances, so concurrent
+    /// triggers can't race each other. Shared via `audio_lock_for`.
     audio_op: Arc<Mutex<()>>,
     a2dp_wait_attempts: u32,
     a2dp_wait_interval: Duration,
@@ -55,13 +56,14 @@ pub struct MediaController {
 
 impl MediaController {
     pub fn new(connected_mac: String, local_mac: String, backend: Arc<dyn AudioBackend>) -> Self {
+        let audio_op = audio_lock_for(&connected_mac);
         let mut state = MediaControllerState::new();
         state.connected_device_mac = connected_mac;
         state.local_mac = local_mac;
         MediaController {
             state: Arc::new(Mutex::new(state)),
             backend,
-            audio_op: Arc::new(Mutex::new(())),
+            audio_op,
             a2dp_wait_attempts: 10,
             a2dp_wait_interval: Duration::from_millis(500),
         }
@@ -82,8 +84,12 @@ impl MediaController {
         info!("Starting playback listener loop");
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            if !aacp_manager.is_connected() {
+                info!("AACP connection closed, stopping playback listener");
+                return;
+            }
 
-            let is_playing = tokio::task::spawn_blocking(|| Self::check_if_playing())
+            let is_playing = tokio::task::spawn_blocking(Self::check_if_playing)
                 .await
                 .unwrap_or(false);
 
@@ -259,7 +265,9 @@ impl MediaController {
 
     pub async fn activate_a2dp_profile(&self) {
         debug!("Entering activate_a2dp_profile");
-        let _audio_op = self.audio_op.lock().await;
+        // Every blocking closure keeps a reference to the guard, so the lock stays held until the
+        // blocking work really ends, even if this task is aborted mid-await.
+        let audio_op = Arc::new(self.audio_op.clone().lock_owned().await);
         let mac = self.state.lock().await.connected_device_mac.clone();
         if mac.is_empty() {
             warn!("Connected device MAC is empty, cannot activate A2DP profile");
@@ -271,7 +279,9 @@ impl MediaController {
         loop {
             let backend = self.backend.clone();
             let mac_clone = mac.clone();
+            let held = audio_op.clone();
             let (action, card_index) = tokio::task::spawn_blocking(move || {
+                let _held = held;
                 let cards = backend.cards();
                 let card = find_bluez_card(&cards, &mac_clone);
                 (plan_a2dp_activation(card), card.map(|c| c.index))
@@ -289,7 +299,9 @@ impl MediaController {
                     info!("Activating A2DP profile for AirPods: {}", profile);
                     let backend = self.backend.clone();
                     let profile_clone = profile.clone();
+                    let held = audio_op.clone();
                     let success = tokio::task::spawn_blocking(move || {
+                        let _held = held;
                         backend.set_card_profile(index, &profile_clone)
                     })
                     .await
@@ -307,7 +319,11 @@ impl MediaController {
                         info!("A2DP not available for {}, asking BlueZ to connect it", mac);
                         let backend = self.backend.clone();
                         let mac_clone = mac.clone();
-                        tokio::task::spawn_blocking(move || backend.connect_a2dp(&mac_clone))
+                        let held = audio_op.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _held = held;
+                            backend.connect_a2dp(&mac_clone)
+                        })
                             .await
                             .unwrap_or(false);
                         continue;
@@ -474,7 +490,7 @@ impl MediaController {
 
     pub async fn deactivate_a2dp_profile(&self) {
         debug!("Entering deactivate_a2dp_profile");
-        let _audio_op = self.audio_op.lock().await;
+        let audio_op = self.audio_op.clone().lock_owned().await;
         let mac = self.state.lock().await.connected_device_mac.clone();
         if mac.is_empty() {
             warn!("Connected device MAC is empty, cannot deactivate A2DP profile");
@@ -483,6 +499,7 @@ impl MediaController {
 
         let backend = self.backend.clone();
         let success = tokio::task::spawn_blocking(move || {
+            let _audio_op = audio_op;
             let cards = backend.cards();
             match find_bluez_card(&cards, &mac) {
                 Some(card) if card.active_profile.as_deref() != Some("off") => {
@@ -736,6 +753,7 @@ mod tests {
         cards_after_connect: Option<Vec<CardSnapshot>>,
         set_calls: StdMutex<Vec<(u32, String)>>,
         connect_calls: AtomicUsize,
+        set_delay: Duration,
     }
 
     impl AudioBackend for FakeBackend {
@@ -744,6 +762,7 @@ mod tests {
         }
 
         fn set_card_profile(&self, card_index: u32, profile: &str) -> bool {
+            std::thread::sleep(self.set_delay);
             self.set_calls
                 .lock()
                 .unwrap()
@@ -889,6 +908,50 @@ mod tests {
     #[test]
     fn no_takeover_without_ear_data() {
         assert!(!should_take_over(false, true, &[]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_off_cannot_land_after_new_activation() {
+        // A MAC no other test uses, so only these two controllers share its audio lock.
+        const STALE_MAC: &str = "11:22:33:44:55:66";
+        let mut card = airpods_card("a2dp-sink-sbc_xq", true);
+        card.name = "bluez_card.11_22_33_44_55_66".to_string();
+        card.device_string = Some(STALE_MAC.to_string());
+        let backend = Arc::new(FakeBackend {
+            cards: StdMutex::new(vec![card]),
+            set_delay: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let make = || {
+            MediaController::new(
+                STALE_MAC.to_string(),
+                "B0:60:88:AF:DD:DA".to_string(),
+                backend.clone(),
+            )
+            .with_a2dp_wait(3, Duration::from_millis(1))
+        };
+        let (old, new) = (make(), make());
+
+        let old_task = tokio::spawn(async move { old.deactivate_a2dp_profile().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        old_task.abort(); // the old instance is torn down mid-"off"
+        new.activate_a2dp_profile().await;
+        // Let any blocking work the aborted instance left behind finish before looking.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let active = backend.cards.lock().unwrap()[0].active_profile.clone();
+        assert_eq!(active.as_deref(), Some("a2dp-sink-sbc_xq"));
+    }
+
+    #[tokio::test]
+    async fn playback_listener_stops_when_aacp_disconnected() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let finished = tokio::time::timeout(
+            Duration::from_secs(3),
+            controller(backend_with(vec![])).run_playback_listener(AACPManager::new(), tx),
+        )
+        .await;
+        assert!(finished.is_ok(), "listener kept running with no AACP connection");
     }
 
     #[tokio::test]
