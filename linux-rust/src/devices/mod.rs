@@ -1,4 +1,5 @@
 pub mod airpods;
+pub mod commands;
 pub mod enums;
 pub mod models;
 pub mod registry;
