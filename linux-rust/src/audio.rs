@@ -10,7 +10,9 @@ use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{error, info, warn};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub const PREFERRED_A2DP_PROFILES: [&str; 3] = ["a2dp-sink-sbc_xq", "a2dp-sink-sbc", "a2dp-sink"];
@@ -51,8 +53,8 @@ pub fn find_bluez_card<'a>(cards: &'a [CardSnapshot], mac: &str) -> Option<&'a C
     })
 }
 
-/// Decides what to do to get A2DP playing on `card`. An active A2DP profile is the user's
-/// choice and is left alone.
+/// Decides what to do to get A2DP playing on `card`. An active A2DP or headset (HFP/HSP)
+/// profile is the user's choice and is left alone; only an "off" card gets activated.
 pub fn plan_a2dp_activation(card: Option<&CardSnapshot>) -> A2dpAction {
     let Some(card) = card else {
         return A2dpAction::NoCard;
@@ -60,7 +62,7 @@ pub fn plan_a2dp_activation(card: Option<&CardSnapshot>) -> A2dpAction {
     if card
         .active_profile
         .as_deref()
-        .is_some_and(|p| p.starts_with("a2dp-sink"))
+        .is_some_and(|p| p.starts_with("a2dp-sink") || p.starts_with("headset-head-unit"))
     {
         return A2dpAction::AlreadyActive;
     }
@@ -73,6 +75,17 @@ pub fn plan_a2dp_activation(card: Option<&CardSnapshot>) -> A2dpAction {
         })
         .map(|p| A2dpAction::SetProfile(p.to_string()))
         .unwrap_or(A2dpAction::ConnectProfile)
+}
+
+/// One lock per Bluetooth device, shared by every instance that ever handles that device, so a
+/// stale instance's card change can never interleave with a new instance's.
+pub fn audio_lock_for(mac: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(mac.to_ascii_uppercase()).or_default().clone()
 }
 
 /// Blocking audio-system operations. Callers run these inside `spawn_blocking`.
@@ -434,6 +447,18 @@ mod tests {
             None,
             Some("a2dp-sink"),
             &[("a2dp-sink", true), ("a2dp-sink-sbc_xq", true)],
+        );
+        assert_eq!(plan_a2dp_activation(Some(&c)), A2dpAction::AlreadyActive);
+    }
+
+    #[test]
+    fn active_headset_profile_is_left_alone() {
+        let c = card(
+            1043,
+            "bluez_card.AA_BB_CC_DD_EE_01",
+            None,
+            Some("headset-head-unit-msbc"),
+            &[("a2dp-sink-sbc_xq", true), ("headset-head-unit-msbc", true)],
         );
         assert_eq!(plan_a2dp_activation(Some(&c)), A2dpAction::AlreadyActive);
     }

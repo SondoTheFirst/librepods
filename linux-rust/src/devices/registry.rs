@@ -6,7 +6,7 @@ use log::{debug, info};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 pub trait ManagedDevice: Send + 'static {
     fn is_alive(&self) -> bool;
@@ -17,6 +17,8 @@ enum Slot<D> {
     /// A connection attempt is running; the number identifies which one.
     Connecting(u64),
     Live(D),
+    /// A disconnected instance is still shutting down; flips to `true` when it is done.
+    ShuttingDown(watch::Receiver<bool>),
 }
 
 struct Inner<D> {
@@ -53,7 +55,7 @@ impl<D: ManagedDevice> DeviceRegistry<D> {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Option<D>> + Send,
     {
-        let (generation, stale) = {
+        let (generation, stale) = loop {
             let mut inner = self.inner.lock().await;
             match inner.slots.get(mac) {
                 Some(Slot::Connecting(_)) => {
@@ -63,6 +65,19 @@ impl<D: ManagedDevice> DeviceRegistry<D> {
                 Some(Slot::Live(device)) if device.is_alive() => {
                     debug!("{} already has a live instance, ignoring", mac);
                     return false;
+                }
+                Some(Slot::ShuttingDown(done)) => {
+                    let mut done = done.clone();
+                    drop(inner);
+                    debug!("Waiting for the old instance of {} to finish shutting down", mac);
+                    if done.wait_for(|finished| *finished).await.is_err() {
+                        // The shutdown went away without finishing; don't wait on it forever.
+                        let mut inner = self.inner.lock().await;
+                        if matches!(inner.slots.get(mac), Some(Slot::ShuttingDown(_))) {
+                            inner.slots.remove(mac);
+                        }
+                    }
+                    continue;
                 }
                 _ => {}
             }
@@ -75,7 +90,7 @@ impl<D: ManagedDevice> DeviceRegistry<D> {
                 Some(Slot::Live(device)) => Some(device),
                 _ => None,
             };
-            (generation, stale)
+            break (generation, stale);
         };
 
         if let Some(old) = stale {
@@ -108,13 +123,30 @@ impl<D: ManagedDevice> DeviceRegistry<D> {
         }
     }
 
-    /// Removes and shuts down the device for `mac`. Returns whether there was one.
+    /// Shuts down and removes the device for `mac`. Returns whether there was one. A connect
+    /// for the same MAC that arrives meanwhile waits until the shutdown has finished.
     pub async fn disconnect(&self, mac: &str) -> bool {
-        let removed = self.inner.lock().await.slots.remove(mac);
-        match removed {
+        let mut inner = self.inner.lock().await;
+        match inner.slots.remove(mac) {
             Some(Slot::Live(device)) => {
+                let (done_tx, done_rx) = watch::channel(false);
+                inner
+                    .slots
+                    .insert(mac.to_string(), Slot::ShuttingDown(done_rx));
+                drop(inner);
                 device.shutdown().await;
+                let mut inner = self.inner.lock().await;
+                if matches!(inner.slots.get(mac), Some(Slot::ShuttingDown(_))) {
+                    inner.slots.remove(mac);
+                }
+                drop(inner);
+                let _ = done_tx.send(true);
                 true
+            }
+            Some(Slot::ShuttingDown(done)) => {
+                // Another disconnect is already handling it.
+                inner.slots.insert(mac.to_string(), Slot::ShuttingDown(done));
+                false
             }
             Some(Slot::Connecting(_)) => true,
             None => false,
@@ -227,6 +259,32 @@ mod tests {
             })
             .await;
         assert!(replaced);
+    }
+
+    #[tokio::test]
+    async fn connect_after_disconnect_waits_for_old_shutdown() {
+        let registry = DeviceRegistry::new();
+        let c = Counters::default();
+        registry
+            .connect_with(MAC, || async { Some(device(&c, true, Duration::from_millis(50))) })
+            .await;
+        let disconnecting = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.disconnect(MAC).await })
+        };
+        sleep(Duration::from_millis(10)).await; // the old instance is mid-shutdown
+        let connected = registry
+            .connect_with(MAC, || async {
+                assert!(
+                    c.old_shutdown_done.load(Ordering::SeqCst),
+                    "new device created while the old one was still shutting down"
+                );
+                Some(device(&c, true, Duration::ZERO))
+            })
+            .await;
+        disconnecting.await.unwrap();
+        assert!(connected);
+        assert!(registry.is_live(MAC).await);
     }
 
     #[tokio::test]

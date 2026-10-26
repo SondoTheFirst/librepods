@@ -1083,23 +1083,27 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
             }
             Err(e) => {
                 debug!("Read error: {}", e);
-                info!(
-                    "We have probably disconnected, clearing state variables (owns, connected devices, control commands, ear detection, audio source)."
-                );
-                let mut state = manager.state.lock().await;
-                state.owns = false;
-                state.connected_devices.clear();
-                state.control_command_status_list.clear();
-                state.ear_detection_status.clear();
-                state.old_ear_detection_status.clear();
-                state.audio_source = None;
+                info!("We have probably disconnected.");
                 break;
             }
         }
     }
-    let mut state = manager.state.lock().await;
-    state.sender = None;
+    info!(
+        "Clearing connection state (owns, connected devices, control commands, ear detection, audio source)."
+    );
+    clear_connection_state(&mut *manager.state.lock().await);
     manager.connected.store(false, Ordering::SeqCst);
+}
+
+/// Forgets everything learned over a connection that has ended, so nothing acts on stale data.
+fn clear_connection_state(state: &mut AACPManagerState) {
+    state.sender = None;
+    state.owns = false;
+    state.connected_devices.clear();
+    state.control_command_status_list.clear();
+    state.ear_detection_status.clear();
+    state.old_ear_detection_status.clear();
+    state.audio_source = None;
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
@@ -1123,4 +1127,27 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
         }
     }
     info!("Send thread finished.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_connection_state_forgets_ear_and_ownership() {
+        let mut state = AACPManagerState::new();
+        state.owns = true;
+        state.ear_detection_status = vec![EarDetectionStatus::InEar, EarDetectionStatus::InEar];
+        state.old_ear_detection_status = vec![EarDetectionStatus::OutOfEar];
+        state.audio_source = Some(AudioSource {
+            mac: "AA:BB:CC:DD:EE:02".to_string(),
+            r#type: AudioSourceType::Media,
+        });
+        clear_connection_state(&mut state);
+        assert!(!state.owns);
+        assert!(state.ear_detection_status.is_empty());
+        assert!(state.old_ear_detection_status.is_empty());
+        assert!(state.audio_source.is_none());
+        assert!(state.sender.is_none());
+    }
 }
