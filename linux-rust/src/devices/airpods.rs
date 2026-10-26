@@ -4,7 +4,11 @@ use crate::bluetooth::battery_provider::{BatteryReporter, system_battery_percent
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
 use crate::devices::registry::ManagedDevice;
 use crate::media_controller::MediaController;
-use crate::prefs::PrefsStore;
+use crate::devices::commands::{
+    bud_from_aacp, cycle_listening_mode, effective_stem_action, press_from_aacp, reapply_on_connect,
+    run_command,
+};
+use crate::prefs::{PrefsStore, StemAction};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
 use bluer::Address;
@@ -14,8 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
-use crate::prefs::load_app_settings;
-use crate::utils::get_app_settings_path;
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
@@ -106,19 +108,12 @@ impl AirPodsDevice {
             error!("Failed to request proximity keys: {}", e);
         }
 
-        let stem_control = load_app_settings(&get_app_settings_path()).stem_control;
-
-        if stem_control {
-            // Enable stem press detection (double and triple tap)
-            // StemConfig bitmask for the control command: single=0x01, double=0x02, triple=0x04, long=0x08
-            // We want double and triple: 0x02 | 0x04 = 0x06
-            // Note: these bitmask values differ from the StemPressType event enum values (0x05–0x08)
-            info!("Enabling stem press detection for double and triple tap");
-            if let Err(e) = aacp_manager
-                .send_control_command(ControlCommandIdentifiers::StemConfig, &[0x06])
-                .await
-            {
-                error!("Failed to enable stem press detection: {}", e);
+        // The AirPods forget some settings when another device connects; send the user's
+        // own choices again (stored listening-mode cycle, stem-press forwarding).
+        for (id, value) in reapply_on_connect(&prefs.device(&mac_address.to_string())) {
+            info!("Re-applying stored {:?}: {}", id, hex::encode(&value));
+            if let Err(e) = aacp_manager.send_control_command(id, &value).await {
+                error!("Failed to re-apply {:?}: {}", id, e);
             }
         }
 
@@ -135,7 +130,7 @@ impl AirPodsDevice {
             mac_address.to_string(),
             local_mac.clone(),
             Arc::new(SystemAudioBackend),
-            prefs,
+            prefs.clone(),
         );
         let mc_clone = media_controller.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -247,6 +242,7 @@ impl AirPodsDevice {
         let local_mac_events = local_mac.clone();
         let ui_tx_clone = ui_tx.clone();
         let command_tx_clone = command_tx.clone();
+        let prefs_events = prefs.clone();
         tasks.spawn(async move {
             while let Some(event) = rx.recv().await {
                 let event_clone = event.clone();
@@ -370,28 +366,26 @@ impl AirPodsDevice {
                         mc_clone.deactivate_a2dp_profile().await;
                     }
                     AACPEvent::StemPress(press_type, bud_type) => {
-                        use crate::bluetooth::aacp::StemPressType;
-                        info!(
-                            "Received Stem Press: {:?} on {:?}",
-                            press_type, bud_type
+                        // Only press types in the forwarding mask arrive here.
+                        let prefs = prefs_events.device(&mac_address.to_string());
+                        let action = effective_stem_action(
+                            &prefs.stem_actions,
+                            bud_from_aacp(bud_type),
+                            press_from_aacp(press_type),
                         );
-                        if stem_control {
-                            let controller = &mc_clone;
-                            match press_type {
-                                StemPressType::DoublePress => {
-                                    info!("Double press detected, skipping to next track");
-                                    controller.next_track().await;
-                                }
-                                StemPressType::TriplePress => {
-                                    info!("Triple press detected, going to previous track");
-                                    controller.previous_track().await;
-                                }
-                                _ => {
-                                    debug!("Unhandled stem press type: {:?}", press_type);
-                                }
+                        info!(
+                            "Stem press {:?} on {:?}: {:?}",
+                            press_type, bud_type, action
+                        );
+                        match action {
+                            StemAction::PlayPause => mc_clone.play_pause().await,
+                            StemAction::NextTrack => mc_clone.next_track().await,
+                            StemAction::PreviousTrack => mc_clone.previous_track().await,
+                            StemAction::CycleListeningMode => {
+                                cycle_listening_mode(&aacp_manager_clone_events, &prefs).await;
                             }
-                        } else {
-                            debug!("Stem control disabled, ignoring stem press event");
+                            StemAction::Command(command) => run_command(&command),
+                            StemAction::Native => {}
                         }
                     }
                     _ => {
