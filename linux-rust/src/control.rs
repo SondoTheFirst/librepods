@@ -105,7 +105,7 @@ pub fn parse_control_args(id: &str, value: &str) -> Result<(u8, Vec<u8>), String
     Ok((id, value))
 }
 
-fn reported<'a>(state: &'a AACPManagerState, id: ControlCommandIdentifiers) -> Option<&'a [u8]> {
+fn reported(state: &AACPManagerState, id: ControlCommandIdentifiers) -> Option<&[u8]> {
     state
         .control_command_status_list
         .iter()

@@ -80,10 +80,7 @@ pub fn bud_from_aacp(bud: StemPressBudType) -> Bud {
     }
 }
 
-fn reported<'a>(
-    controls: &'a [ControlCommandStatus],
-    id: ControlCommandIdentifiers,
-) -> Option<&'a [u8]> {
+fn reported(controls: &[ControlCommandStatus], id: ControlCommandIdentifiers) -> Option<&[u8]> {
     controls
         .iter()
         .find(|status| status.identifier == id)
