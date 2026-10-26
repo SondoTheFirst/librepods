@@ -1,9 +1,13 @@
 use aes::Aes128;
 use aes::cipher::Array;
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
+use crate::bluetooth::aacp::ProximityKeyType;
+use crate::devices::airpods::AirPodsInformation;
+use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use iced::Theme;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 pub fn get_devices_path() -> PathBuf {
     let data_dir = std::env::var("XDG_DATA_HOME")
@@ -49,6 +53,74 @@ pub fn get_app_settings_path() -> PathBuf {
     }
 
     new_path
+}
+
+/// Read-modify-write of one entry in devices.json. Re-reads the file every time so other
+/// writers' changes are kept, backs up a corrupt file instead of failing, and replaces the
+/// file atomically.
+pub fn update_devices_file(
+    path: &Path,
+    mac: &str,
+    update: impl FnOnce(&mut DeviceData),
+) -> std::io::Result<()> {
+    let mut devices: HashMap<String, DeviceData> = match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(devices) => devices,
+            Err(e) => {
+                log::warn!(
+                    "{} is not valid JSON ({}), backing it up and starting fresh",
+                    path.display(),
+                    e
+                );
+                std::fs::rename(path, path.with_extension("json.bak"))?;
+                HashMap::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => return Err(e),
+    };
+
+    let entry = devices.entry(mac.to_string()).or_insert_with(|| DeviceData {
+        name: mac.to_string(),
+        type_: DeviceType::AirPods,
+        information: None,
+    });
+    update(entry);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string(&devices).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Stores freshly received AirPods information, keeping LE keys learned earlier.
+pub fn apply_information(data: &mut DeviceData, mut info: AirPodsInformation) {
+    if let Some(DeviceInformation::AirPods(existing)) = &data.information {
+        info.le_keys = existing.le_keys.clone();
+    }
+    if !info.name.is_empty() {
+        data.name = info.name.clone();
+    }
+    data.information = Some(DeviceInformation::AirPods(info));
+}
+
+/// Stores one LE key, creating the AirPods information entry if it doesn't exist yet.
+pub fn apply_le_key(data: &mut DeviceData, key_type: ProximityKeyType, key_hex: &str) {
+    if !matches!(data.information, Some(DeviceInformation::AirPods(_))) {
+        data.information = Some(DeviceInformation::AirPods(AirPodsInformation {
+            name: data.name.clone(),
+            ..Default::default()
+        }));
+    }
+    if let Some(DeviceInformation::AirPods(info)) = data.information.as_mut() {
+        match key_type {
+            ProximityKeyType::Irk => info.le_keys.irk = key_hex.to_string(),
+            ProximityKeyType::EncKey => info.le_keys.enc_key = key_hex.to_string(),
+        }
+    }
 }
 
 fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
@@ -154,5 +226,97 @@ impl From<MyTheme> for Theme {
             MyTheme::Oxocarbon => Theme::Oxocarbon,
             MyTheme::Ferra => Theme::Ferra,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bluetooth::aacp::ProximityKeyType;
+    use crate::devices::airpods::AirPodsInformation;
+    use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
+    use std::collections::HashMap;
+
+    const MAC: &str = "8C:7A:AA:D0:3B:50";
+
+    fn read_devices(path: &std::path::Path) -> HashMap<String, DeviceData> {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn airpods_info(data: &DeviceData) -> &AirPodsInformation {
+        match &data.information {
+            Some(DeviceInformation::AirPods(info)) => info,
+            other => panic!("expected AirPods information, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn creates_entry_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devices.json");
+        update_devices_file(&path, MAC, |_| {}).unwrap();
+        let devices = read_devices(&path);
+        assert_eq!(devices[MAC].type_, DeviceType::AirPods);
+    }
+
+    #[test]
+    fn preserves_other_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devices.json");
+        let nothing = r#"{"AA:BB:CC:DD:EE:FF":{"name":"Ear (1)","type_":"Nothing","information":null}}"#;
+        std::fs::write(&path, nothing).unwrap();
+        update_devices_file(&path, MAC, |d| d.name = "Logan's AirPods Pro".to_string()).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let before: serde_json::Value = serde_json::from_str(nothing).unwrap();
+        assert_eq!(after["AA:BB:CC:DD:EE:FF"], before["AA:BB:CC:DD:EE:FF"]);
+        assert_eq!(after[MAC]["name"], "Logan's AirPods Pro");
+    }
+
+    #[test]
+    fn corrupt_file_is_backed_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devices.json");
+        std::fs::write(&path, "{not json").unwrap();
+        update_devices_file(&path, MAC, |_| {}).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("devices.json.bak")).unwrap(),
+            "{not json"
+        );
+        assert_eq!(read_devices(&path).len(), 1);
+    }
+
+    #[test]
+    fn apply_le_key_creates_information_when_missing() {
+        let mut data = DeviceData {
+            name: MAC.to_string(),
+            type_: DeviceType::AirPods,
+            information: None,
+        };
+        apply_le_key(&mut data, ProximityKeyType::Irk, "00ff");
+        assert_eq!(airpods_info(&data).le_keys.irk, "00ff");
+    }
+
+    #[test]
+    fn apply_information_keeps_existing_keys() {
+        let mut existing = AirPodsInformation::default();
+        existing.le_keys.irk = "aa".to_string();
+        existing.le_keys.enc_key = "bb".to_string();
+        let mut data = DeviceData {
+            name: MAC.to_string(),
+            type_: DeviceType::AirPods,
+            information: Some(DeviceInformation::AirPods(existing)),
+        };
+        let incoming = AirPodsInformation {
+            name: "Logan's AirPods Pro".to_string(),
+            model_number: "A2084".to_string(),
+            ..Default::default()
+        };
+        apply_information(&mut data, incoming);
+        let info = airpods_info(&data);
+        assert_eq!(info.le_keys.irk, "aa");
+        assert_eq!(info.le_keys.enc_key, "bb");
+        assert_eq!(info.model_number, "A2084");
+        assert_eq!(data.name, "Logan's AirPods Pro");
     }
 }
