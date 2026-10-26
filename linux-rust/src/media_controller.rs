@@ -1,13 +1,12 @@
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use crate::audio::{
-    AudioBackend, SystemAudioBackend, get_sink_name_by_mac, get_sink_volume_percent_by_name_sync,
-    set_card_profile_sync, transition_sink_volume,
+    A2dpAction, AudioBackend, find_bluez_card, get_sink_name_by_mac,
+    get_sink_volume_percent_by_name_sync, plan_a2dp_activation, transition_sink_volume,
 };
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use log::{debug, error, info, warn};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -17,8 +16,6 @@ struct MediaControllerState {
     local_mac: String,
     is_playing: bool,
     paused_by_app_services: Vec<String>,
-    device_index: Option<u32>,
-    cached_a2dp_profile: String,
     old_in_ear_data: Vec<bool>,
     user_played_the_media: bool,
     i_paused_the_media: bool,
@@ -36,8 +33,6 @@ impl MediaControllerState {
             local_mac: String::new(),
             is_playing: false,
             paused_by_app_services: Vec::new(),
-            device_index: None,
-            cached_a2dp_profile: String::new(),
             old_in_ear_data: vec![false, false],
             user_played_the_media: false,
             i_paused_the_media: false,
@@ -53,16 +48,32 @@ impl MediaControllerState {
 #[derive(Clone)]
 pub struct MediaController {
     state: Arc<Mutex<MediaControllerState>>,
+    backend: Arc<dyn AudioBackend>,
+    /// Serializes every card-profile change so concurrent triggers can't race each other.
+    audio_op: Arc<Mutex<()>>,
+    a2dp_wait_attempts: u32,
+    a2dp_wait_interval: Duration,
 }
 
 impl MediaController {
-    pub fn new(connected_mac: String, local_mac: String) -> Self {
+    pub fn new(connected_mac: String, local_mac: String, backend: Arc<dyn AudioBackend>) -> Self {
         let mut state = MediaControllerState::new();
         state.connected_device_mac = connected_mac;
         state.local_mac = local_mac;
         MediaController {
             state: Arc::new(Mutex::new(state)),
+            backend,
+            audio_op: Arc::new(Mutex::new(())),
+            a2dp_wait_attempts: 10,
+            a2dp_wait_interval: Duration::from_millis(500),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_a2dp_wait(mut self, attempts: u32, interval: Duration) -> Self {
+        self.a2dp_wait_attempts = attempts;
+        self.a2dp_wait_interval = interval;
+        self
     }
 
     pub async fn start_playback_listener(
@@ -277,73 +288,67 @@ impl MediaController {
 
     pub async fn activate_a2dp_profile(&self) {
         debug!("Entering activate_a2dp_profile");
-        let state = self.state.lock().await;
-
-        if state.connected_device_mac.is_empty() {
+        let _audio_op = self.audio_op.lock().await;
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        if mac.is_empty() {
             warn!("Connected device MAC is empty, cannot activate A2DP profile");
             return;
         }
 
-        let device_index = state.device_index;
-        let mac = state.connected_device_mac.clone();
-        drop(state);
+        let mut connect_attempted = false;
+        let mut polls = 0;
+        loop {
+            let backend = self.backend.clone();
+            let mac_clone = mac.clone();
+            let (action, card_index) = tokio::task::spawn_blocking(move || {
+                let cards = backend.cards();
+                let card = find_bluez_card(&cards, &mac_clone);
+                (plan_a2dp_activation(card), card.map(|c| c.index))
+            })
+            .await
+            .unwrap_or((A2dpAction::NoCard, None));
 
-        let mut current_device_index = device_index;
-
-        if current_device_index.is_none() {
-            warn!("Device index not found, trying to get it.");
-            current_device_index = self.get_audio_device_index(&mac).await;
-            if let Some(idx) = current_device_index {
-                self.state.lock().await.device_index = Some(idx);
-            } else {
-                warn!("Could not get device index. Cannot activate A2DP profile.");
-                return;
-            }
-        }
-
-        if !self.is_a2dp_profile_available().await {
-            warn!("A2DP profile not available, attempting to restart WirePlumber");
-            if self.restart_wire_plumber().await {
-                let mut state = self.state.lock().await;
-                state.device_index = self
-                    .get_audio_device_index(&state.connected_device_mac)
-                    .await;
-                debug!(
-                    "Updated device_index after WirePlumber restart: {:?}",
-                    state.device_index
-                );
-                if !self.is_a2dp_profile_available().await {
-                    error!("A2DP profile still not available after WirePlumber restart");
+            match action {
+                A2dpAction::AlreadyActive => {
+                    debug!("A2DP profile already active for {}", mac);
                     return;
                 }
-            } else {
-                error!("Could not restart WirePlumber, A2DP profile unavailable");
-                return;
-            }
-        }
-
-        let preferred_profile = self.get_preferred_a2dp_profile().await;
-        if preferred_profile.is_empty() {
-            error!("No suitable A2DP profile found");
-            return;
-        }
-
-        let device_index = self.state.lock().await.device_index;
-        if let Some(idx) = device_index {
-            info!("Activating A2DP profile for AirPods: {}", preferred_profile);
-            let profile_name = preferred_profile.clone();
-            let success =
-                tokio::task::spawn_blocking(move || set_card_profile_sync(idx, &profile_name))
+                A2dpAction::SetProfile(profile) => {
+                    let Some(index) = card_index else { return };
+                    info!("Activating A2DP profile for AirPods: {}", profile);
+                    let backend = self.backend.clone();
+                    let profile_clone = profile.clone();
+                    let success = tokio::task::spawn_blocking(move || {
+                        backend.set_card_profile(index, &profile_clone)
+                    })
                     .await
                     .unwrap_or(false);
-
-            if success {
-                info!("Successfully activated A2DP profile: {}", preferred_profile);
-            } else {
-                warn!("Failed to activate A2DP profile: {}", preferred_profile);
+                    if success {
+                        info!("Successfully activated A2DP profile: {}", profile);
+                    } else {
+                        warn!("Failed to activate A2DP profile: {}", profile);
+                    }
+                    return;
+                }
+                A2dpAction::ConnectProfile | A2dpAction::NoCard => {
+                    if !connect_attempted {
+                        connect_attempted = true;
+                        info!("A2DP not available for {}, asking BlueZ to connect it", mac);
+                        let backend = self.backend.clone();
+                        let mac_clone = mac.clone();
+                        tokio::task::spawn_blocking(move || backend.connect_a2dp(&mac_clone))
+                            .await
+                            .unwrap_or(false);
+                        continue;
+                    }
+                    if polls >= self.a2dp_wait_attempts {
+                        warn!("A2DP still not available for {}, giving up", mac);
+                        return;
+                    }
+                    polls += 1;
+                    tokio::time::sleep(self.a2dp_wait_interval).await;
+                }
             }
-        } else {
-            error!("Device index not available for activating profile.");
         }
     }
 
@@ -496,154 +501,37 @@ impl MediaController {
         self.mpris_command("Previous").await;
     }
 
-    async fn is_a2dp_profile_available(&self) -> bool {
-        let index = match self.state.lock().await.device_index {
-            Some(i) => i,
-            None => {
-                debug!("Device index is None, returning false");
-                return false;
-            }
-        };
-
-        tokio::task::spawn_blocking(move || {
-            let available = SystemAudioBackend.cards()
-                .iter()
-                .find(|c| c.index == index)
-                .map(|card| {
-                    card.profiles
-                        .iter()
-                        .any(|p| p.name.starts_with("a2dp-sink"))
-                })
-                .unwrap_or(false);
-            debug!("A2DP profile available: {}", available);
-            available
-        })
-            .await
-            .unwrap_or(false)
-    }
-
-    async fn get_preferred_a2dp_profile(&self) -> String {
-        let state = self.state.lock().await;
-        let device_index = state.device_index;
-        let cached_profile = state.cached_a2dp_profile.clone();
-        drop(state);
-
-        let index = match device_index {
-            Some(i) => i,
-            None => return String::new(),
-        };
-
-        if !cached_profile.is_empty() && self.is_profile_available(index, &cached_profile).await {
-            debug!("Using cached A2DP profile: {}", cached_profile);
-            return cached_profile;
-        }
-
-        for profile in ["a2dp-sink-sbc_xq", "a2dp-sink-sbc", "a2dp-sink"] {
-            if self.is_profile_available(index, profile).await {
-                info!("Selected best available A2DP profile: {}", profile);
-                self.state.lock().await.cached_a2dp_profile = profile.to_string();
-                return profile.to_string();
-            }
-        }
-        debug!("No suitable profile found");
-        String::new()
-    }
-
-    async fn is_profile_available(&self, card_index: u32, profile: &str) -> bool {
-        let profile_name = profile.to_string();
-        tokio::task::spawn_blocking(move || {
-            let available = SystemAudioBackend.cards()
-                .iter()
-                .find(|c| c.index == card_index)
-                .map(|card| {
-                    card.profiles
-                        .iter()
-                        .any(|p| p.name == profile_name)
-                })
-                .unwrap_or(false);
-            debug!("Profile {} available: {}", profile_name, available);
-            available
-        })
-            .await
-            .unwrap_or(false)
-    }
-
-    async fn restart_wire_plumber(&self) -> bool {
-        info!("Restarting WirePlumber to rediscover A2DP profiles");
-        let result = Command::new("systemctl")
-            .args(["--user", "restart", "wireplumber"])
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                info!("WirePlumber restarted successfully");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                true
-            }
-            _ => {
-                error!("Failed to restart WirePlumber. Do you use wireplumber?");
-                false
-            }
-        }
-    }
-
-    async fn get_audio_device_index(&self, mac: &str) -> Option<u32> {
-        if mac.is_empty() {
-            return None;
-        }
-        let mac_clone = mac.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            for card in SystemAudioBackend.cards() {
-                if let Some(device_string) = card.device_string.as_deref()
-                    && device_string.contains(&mac_clone)
-                {
-                    info!("Found audio device index for MAC {}: {}", mac_clone, card.index);
-                    return Some(card.index);
-                }
-            }
-            error!("No matching Bluetooth card found for MAC address: {}", mac_clone);
-            None
-        })
-            .await
-            .unwrap_or(None)
-    }
-
     pub async fn deactivate_a2dp_profile(&self) {
         debug!("Entering deactivate_a2dp_profile");
-        let mut state = self.state.lock().await;
-
-        if state.device_index.is_none() {
-            state.device_index = self
-                .get_audio_device_index(&state.connected_device_mac)
-                .await;
-        }
-
-        if state.connected_device_mac.is_empty() || state.device_index.is_none() {
-            warn!("Connected device MAC or index is empty, cannot deactivate A2DP profile");
+        let _audio_op = self.audio_op.lock().await;
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        if mac.is_empty() {
+            warn!("Connected device MAC is empty, cannot deactivate A2DP profile");
             return;
         }
-        let device_index = state.device_index.unwrap();
-        drop(state);
 
-        info!("Deactivating A2DP profile for AirPods by setting to off");
-
+        let backend = self.backend.clone();
         let success = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                set_card_profile_sync(device_index, "off")
-            }))
-                .unwrap_or_else(|e| {
-                    warn!("Panic in set_card_profile_sync: {:?}", e);
-                    false
-                })
+            let cards = backend.cards();
+            match find_bluez_card(&cards, &mac) {
+                Some(card) if card.active_profile.as_deref() != Some("off") => {
+                    info!("Deactivating A2DP profile for AirPods by setting to off");
+                    Some(backend.set_card_profile(card.index, "off"))
+                }
+                Some(_) => None,
+                None => {
+                    debug!("No audio card for {}, nothing to deactivate", mac);
+                    None
+                }
+            }
         })
-            .await
-            .unwrap_or(false);
+        .await
+        .unwrap_or(Some(false));
 
-        if success {
-            info!("Successfully deactivated A2DP profile");
-        } else {
-            warn!("Failed to deactivate A2DP profile");
+        match success {
+            Some(true) => info!("Successfully deactivated A2DP profile"),
+            Some(false) => warn!("Failed to deactivate A2DP profile"),
+            None => {}
         }
     }
 
@@ -854,5 +742,161 @@ impl MediaController {
                 s.starts_with("org.mpris.MediaPlayer2.") && !Self::is_kdeconnect_service(s)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{CardSnapshot, ProfileSnapshot};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const MAC: &str = "AA:BB:CC:DD:EE:01";
+
+    #[derive(Default)]
+    struct FakeBackend {
+        cards: StdMutex<Vec<CardSnapshot>>,
+        cards_after_connect: Option<Vec<CardSnapshot>>,
+        set_calls: StdMutex<Vec<(u32, String)>>,
+        connect_calls: AtomicUsize,
+    }
+
+    impl AudioBackend for FakeBackend {
+        fn cards(&self) -> Vec<CardSnapshot> {
+            self.cards.lock().unwrap().clone()
+        }
+
+        fn set_card_profile(&self, card_index: u32, profile: &str) -> bool {
+            self.set_calls
+                .lock()
+                .unwrap()
+                .push((card_index, profile.to_string()));
+            for card in self.cards.lock().unwrap().iter_mut() {
+                if card.index == card_index {
+                    card.active_profile = Some(profile.to_string());
+                }
+            }
+            true
+        }
+
+        fn connect_a2dp(&self, _mac: &str) -> bool {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cards) = &self.cards_after_connect {
+                *self.cards.lock().unwrap() = cards.clone();
+            }
+            true
+        }
+    }
+
+    fn airpods_card(active: &str, sbc_xq_available: bool) -> CardSnapshot {
+        CardSnapshot {
+            index: 1043,
+            name: "bluez_card.AA_BB_CC_DD_EE_01".to_string(),
+            device_string: Some(MAC.to_string()),
+            active_profile: Some(active.to_string()),
+            profiles: vec![
+                ProfileSnapshot { name: "off".to_string(), available: true },
+                ProfileSnapshot {
+                    name: "a2dp-sink-sbc_xq".to_string(),
+                    available: sbc_xq_available,
+                },
+                ProfileSnapshot { name: "a2dp-sink".to_string(), available: true },
+            ],
+        }
+    }
+
+    fn hdmi_card() -> CardSnapshot {
+        CardSnapshot {
+            index: 940,
+            name: "alsa_card.pci-0000_01_00.1".to_string(),
+            device_string: None,
+            active_profile: Some("output:hdmi-stereo".to_string()),
+            profiles: vec![],
+        }
+    }
+
+    fn controller(backend: Arc<FakeBackend>) -> MediaController {
+        MediaController::new(MAC.to_string(), "AA:BB:CC:DD:EE:02".to_string(), backend)
+            .with_a2dp_wait(3, Duration::from_millis(1))
+    }
+
+    fn backend_with(cards: Vec<CardSnapshot>) -> Arc<FakeBackend> {
+        Arc::new(FakeBackend {
+            cards: StdMutex::new(cards),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn activate_sets_preferred_profile_once() {
+        let backend = backend_with(vec![airpods_card("off", true)]);
+        controller(backend.clone()).activate_a2dp_profile().await;
+        assert_eq!(
+            *backend.set_calls.lock().unwrap(),
+            vec![(1043, "a2dp-sink-sbc_xq".to_string())]
+        );
+        assert_eq!(backend.connect_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn activate_does_nothing_when_a2dp_already_active() {
+        let backend = backend_with(vec![airpods_card("a2dp-sink", true)]);
+        controller(backend.clone()).activate_a2dp_profile().await;
+        assert!(backend.set_calls.lock().unwrap().is_empty());
+        assert_eq!(backend.connect_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn activate_connects_profile_via_bluez_when_missing_then_sets_profile() {
+        let backend = Arc::new(FakeBackend {
+            cards_after_connect: Some(vec![airpods_card("off", true)]),
+            ..Default::default()
+        });
+        controller(backend.clone()).activate_a2dp_profile().await;
+        assert_eq!(backend.connect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *backend.set_calls.lock().unwrap(),
+            vec![(1043, "a2dp-sink-sbc_xq".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_gives_up_without_restarting_anything() {
+        let backend = backend_with(vec![]);
+        controller(backend.clone()).activate_a2dp_profile().await;
+        assert_eq!(backend.connect_calls.load(Ordering::SeqCst), 1);
+        assert!(backend.set_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_activations_set_profile_once() {
+        let backend = backend_with(vec![airpods_card("off", true)]);
+        let mc = controller(backend.clone());
+        let (a, b, c) = (mc.clone(), mc.clone(), mc.clone());
+        tokio::join!(
+            a.activate_a2dp_profile(),
+            b.activate_a2dp_profile(),
+            c.activate_a2dp_profile()
+        );
+        assert_eq!(backend.set_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deactivate_only_touches_airpods_card() {
+        let backend = backend_with(vec![hdmi_card(), airpods_card("a2dp-sink-sbc_xq", true)]);
+        controller(backend.clone()).deactivate_a2dp_profile().await;
+        assert_eq!(
+            *backend.set_calls.lock().unwrap(),
+            vec![(1043, "off".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivate_without_card_does_nothing() {
+        let backend = backend_with(vec![]);
+        controller(backend.clone()).deactivate_a2dp_profile().await;
+        assert!(backend.set_calls.lock().unwrap().is_empty());
+        assert_eq!(backend.connect_calls.load(Ordering::SeqCst), 0);
     }
 }
