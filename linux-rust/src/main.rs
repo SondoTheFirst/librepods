@@ -1,3 +1,4 @@
+mod audio;
 mod bluetooth;
 mod devices;
 mod media_controller;
