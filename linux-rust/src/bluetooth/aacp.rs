@@ -48,12 +48,28 @@ pub struct ControlCommandStatus {
     pub value: Vec<u8>,
 }
 
+/// Every known AACP control-command identifier (opcode 0x09). Names follow the Android app.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlCommandIdentifiers {
     MicMode = 0x01,
+    Scan = 0x02,
+    Reset = 0x03,
+    BasicDoubleTapMode = 0x04,
     ButtonSendMode = 0x05,
+    OwnsConnection = 0x06,
+    TapInterval = 0x07,
+    BudRole = 0x08,
+    DebugGetData = 0x09,
+    EarDetectionConfig = 0x0A,
+    JitterBuffer = 0x0B,
+    DoubleTapMode = 0x0C,
+    ListeningMode = 0x0D,
+    HeartRateMonitor1 = 0x0E,
+    HeartRateMonitor2 = 0x0F,
+    SwitchControl = 0x11,
     VoiceTrigger = 0x12,
+    DoapMode = 0x13,
     SingleClickMode = 0x14,
     DoubleClickMode = 0x15,
     ClickHoldMode = 0x16,
@@ -62,9 +78,10 @@ pub enum ControlCommandIdentifiers {
     ListeningModeConfigs = 0x1A,
     OneBudAncMode = 0x1B,
     CrownRotationDirection = 0x1C,
-    ListeningMode = 0x0D,
     AutoAnswerMode = 0x1E,
     ChimeVolume = 0x1F,
+    AutomaticConnectionConfig = 0x20,
+    HfpUplinkMode = 0x22,
     VolumeSwipeInterval = 0x23,
     CallManagementConfig = 0x24,
     VolumeSwipeMode = 0x25,
@@ -80,20 +97,105 @@ pub enum ControlCommandIdentifiers {
     SiriMultitoneConfig = 0x32,
     HearingAssistConfig = 0x33,
     AllowOffOption = 0x34,
-    StemConfig = 0x39,
     SleepDetectionConfig = 0x35,
     AllowAutoConnect = 0x36,
-    EarDetectionConfig = 0x0A,
-    AutomaticConnectionConfig = 0x20,
-    OwnsConnection = 0x06,
+    PpeToggleConfig = 0x37,
+    PpeCapLevelConfig = 0x38,
+    StemConfig = 0x39,
+    AllowTemporaryManagedPairing = 0x3A,
+    DynamicEndOfCharge = 0x3B,
+    SystemSiriMode = 0x3C,
+    HearingAidGeneric = 0x3D,
+    UplinkEqBud = 0x3E,
+    UplinkEqSource = 0x3F,
+    InCaseToneVolume = 0x40,
+    DisableButtonInput = 0x41,
+    ExtendedHoldAndRelease = 0x42,
 }
 
 impl ControlCommandIdentifiers {
+    pub const ALL: &'static [ControlCommandIdentifiers] = &[
+        Self::MicMode,
+        Self::Scan,
+        Self::Reset,
+        Self::BasicDoubleTapMode,
+        Self::ButtonSendMode,
+        Self::OwnsConnection,
+        Self::TapInterval,
+        Self::BudRole,
+        Self::DebugGetData,
+        Self::EarDetectionConfig,
+        Self::JitterBuffer,
+        Self::DoubleTapMode,
+        Self::ListeningMode,
+        Self::HeartRateMonitor1,
+        Self::HeartRateMonitor2,
+        Self::SwitchControl,
+        Self::VoiceTrigger,
+        Self::DoapMode,
+        Self::SingleClickMode,
+        Self::DoubleClickMode,
+        Self::ClickHoldMode,
+        Self::DoubleClickInterval,
+        Self::ClickHoldInterval,
+        Self::ListeningModeConfigs,
+        Self::OneBudAncMode,
+        Self::CrownRotationDirection,
+        Self::AutoAnswerMode,
+        Self::ChimeVolume,
+        Self::AutomaticConnectionConfig,
+        Self::HfpUplinkMode,
+        Self::VolumeSwipeInterval,
+        Self::CallManagementConfig,
+        Self::VolumeSwipeMode,
+        Self::AdaptiveVolumeConfig,
+        Self::SoftwareMuteConfig,
+        Self::ConversationDetectConfig,
+        Self::Ssl,
+        Self::HearingAid,
+        Self::AutoAncStrength,
+        Self::HpsGainSwipe,
+        Self::HrmState,
+        Self::InCaseToneConfig,
+        Self::SiriMultitoneConfig,
+        Self::HearingAssistConfig,
+        Self::AllowOffOption,
+        Self::SleepDetectionConfig,
+        Self::AllowAutoConnect,
+        Self::PpeToggleConfig,
+        Self::PpeCapLevelConfig,
+        Self::StemConfig,
+        Self::AllowTemporaryManagedPairing,
+        Self::DynamicEndOfCharge,
+        Self::SystemSiriMode,
+        Self::HearingAidGeneric,
+        Self::UplinkEqBud,
+        Self::UplinkEqSource,
+        Self::InCaseToneVolume,
+        Self::DisableButtonInput,
+        Self::ExtendedHoldAndRelease,
+    ];
+
     fn from_u8(value: u8) -> Option<Self> {
         match value {
             0x01 => Some(Self::MicMode),
+            0x02 => Some(Self::Scan),
+            0x03 => Some(Self::Reset),
+            0x04 => Some(Self::BasicDoubleTapMode),
             0x05 => Some(Self::ButtonSendMode),
+            0x06 => Some(Self::OwnsConnection),
+            0x07 => Some(Self::TapInterval),
+            0x08 => Some(Self::BudRole),
+            0x09 => Some(Self::DebugGetData),
+            0x0A => Some(Self::EarDetectionConfig),
+            0x0B => Some(Self::JitterBuffer),
+            0x0C => Some(Self::DoubleTapMode),
+            0x0D => Some(Self::ListeningMode),
+            0x0E => Some(Self::HeartRateMonitor1),
+            0x0F => Some(Self::HeartRateMonitor2),
+            0x11 => Some(Self::SwitchControl),
             0x12 => Some(Self::VoiceTrigger),
+            0x13 => Some(Self::DoapMode),
             0x14 => Some(Self::SingleClickMode),
             0x15 => Some(Self::DoubleClickMode),
             0x16 => Some(Self::ClickHoldMode),
@@ -102,9 +204,10 @@ impl ControlCommandIdentifiers {
             0x1A => Some(Self::ListeningModeConfigs),
             0x1B => Some(Self::OneBudAncMode),
             0x1C => Some(Self::CrownRotationDirection),
-            0x0D => Some(Self::ListeningMode),
             0x1E => Some(Self::AutoAnswerMode),
             0x1F => Some(Self::ChimeVolume),
+            0x20 => Some(Self::AutomaticConnectionConfig),
+            0x22 => Some(Self::HfpUplinkMode),
             0x23 => Some(Self::VolumeSwipeInterval),
             0x24 => Some(Self::CallManagementConfig),
             0x25 => Some(Self::VolumeSwipeMode),
@@ -120,12 +223,20 @@ impl ControlCommandIdentifiers {
             0x32 => Some(Self::SiriMultitoneConfig),
             0x33 => Some(Self::HearingAssistConfig),
             0x34 => Some(Self::AllowOffOption),
-            0x39 => Some(Self::StemConfig),
             0x35 => Some(Self::SleepDetectionConfig),
             0x36 => Some(Self::AllowAutoConnect),
-            0x0A => Some(Self::EarDetectionConfig),
-            0x20 => Some(Self::AutomaticConnectionConfig),
-            0x06 => Some(Self::OwnsConnection),
+            0x37 => Some(Self::PpeToggleConfig),
+            0x38 => Some(Self::PpeCapLevelConfig),
+            0x39 => Some(Self::StemConfig),
+            0x3A => Some(Self::AllowTemporaryManagedPairing),
+            0x3B => Some(Self::DynamicEndOfCharge),
+            0x3C => Some(Self::SystemSiriMode),
+            0x3D => Some(Self::HearingAidGeneric),
+            0x3E => Some(Self::UplinkEqBud),
+            0x3F => Some(Self::UplinkEqSource),
+            0x40 => Some(Self::InCaseToneVolume),
+            0x41 => Some(Self::DisableButtonInput),
+            0x42 => Some(Self::ExtendedHoldAndRelease),
             _ => None,
         }
     }
@@ -135,8 +246,23 @@ impl std::fmt::Display for ControlCommandIdentifiers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
             ControlCommandIdentifiers::MicMode => "Mic Mode",
+            ControlCommandIdentifiers::Scan => "Scan",
+            ControlCommandIdentifiers::Reset => "Reset",
+            ControlCommandIdentifiers::BasicDoubleTapMode => "Basic Double Tap Mode",
             ControlCommandIdentifiers::ButtonSendMode => "Button Send Mode",
+            ControlCommandIdentifiers::OwnsConnection => "Owns Connection",
+            ControlCommandIdentifiers::TapInterval => "Tap Interval",
+            ControlCommandIdentifiers::BudRole => "Bud Role",
+            ControlCommandIdentifiers::DebugGetData => "Debug Get Data",
+            ControlCommandIdentifiers::EarDetectionConfig => "Ear Detection Config",
+            ControlCommandIdentifiers::JitterBuffer => "Jitter Buffer",
+            ControlCommandIdentifiers::DoubleTapMode => "Double Tap Mode",
+            ControlCommandIdentifiers::ListeningMode => "Listening Mode",
+            ControlCommandIdentifiers::HeartRateMonitor1 => "Heart Rate Monitor 1",
+            ControlCommandIdentifiers::HeartRateMonitor2 => "Heart Rate Monitor 2",
+            ControlCommandIdentifiers::SwitchControl => "Switch Control",
             ControlCommandIdentifiers::VoiceTrigger => "Voice Trigger",
+            ControlCommandIdentifiers::DoapMode => "DOAP Mode",
             ControlCommandIdentifiers::SingleClickMode => "Single Click Mode",
             ControlCommandIdentifiers::DoubleClickMode => "Double Click Mode",
             ControlCommandIdentifiers::ClickHoldMode => "Click Hold Mode",
@@ -145,9 +271,10 @@ impl std::fmt::Display for ControlCommandIdentifiers {
             ControlCommandIdentifiers::ListeningModeConfigs => "Listening Mode Configs",
             ControlCommandIdentifiers::OneBudAncMode => "One Bud ANC Mode",
             ControlCommandIdentifiers::CrownRotationDirection => "Crown Rotation Direction",
-            ControlCommandIdentifiers::ListeningMode => "Listening Mode",
             ControlCommandIdentifiers::AutoAnswerMode => "Auto Answer Mode",
             ControlCommandIdentifiers::ChimeVolume => "Chime Volume",
+            ControlCommandIdentifiers::AutomaticConnectionConfig => "Automatic Connection Config",
+            ControlCommandIdentifiers::HfpUplinkMode => "HFP Uplink Mode",
             ControlCommandIdentifiers::VolumeSwipeInterval => "Volume Swipe Interval",
             ControlCommandIdentifiers::CallManagementConfig => "Call Management Config",
             ControlCommandIdentifiers::VolumeSwipeMode => "Volume Swipe Mode",
@@ -163,12 +290,20 @@ impl std::fmt::Display for ControlCommandIdentifiers {
             ControlCommandIdentifiers::SiriMultitoneConfig => "Siri Multitone Config",
             ControlCommandIdentifiers::HearingAssistConfig => "Hearing Assist Config",
             ControlCommandIdentifiers::AllowOffOption => "Allow Off Option",
-            ControlCommandIdentifiers::StemConfig => "Stem Config",
             ControlCommandIdentifiers::SleepDetectionConfig => "Sleep Detection Config",
             ControlCommandIdentifiers::AllowAutoConnect => "Allow Auto Connect",
-            ControlCommandIdentifiers::EarDetectionConfig => "Ear Detection Config",
-            ControlCommandIdentifiers::AutomaticConnectionConfig => "Automatic Connection Config",
-            ControlCommandIdentifiers::OwnsConnection => "Owns Connection",
+            ControlCommandIdentifiers::PpeToggleConfig => "PPE Toggle Config",
+            ControlCommandIdentifiers::PpeCapLevelConfig => "PPE Cap Level Config",
+            ControlCommandIdentifiers::StemConfig => "Stem Config",
+            ControlCommandIdentifiers::AllowTemporaryManagedPairing => "Allow Temporary Managed Pairing",
+            ControlCommandIdentifiers::DynamicEndOfCharge => "Dynamic End Of Charge",
+            ControlCommandIdentifiers::SystemSiriMode => "System Siri Mode",
+            ControlCommandIdentifiers::HearingAidGeneric => "Hearing Aid Generic",
+            ControlCommandIdentifiers::UplinkEqBud => "Uplink EQ Bud",
+            ControlCommandIdentifiers::UplinkEqSource => "Uplink EQ Source",
+            ControlCommandIdentifiers::InCaseToneVolume => "In Case Tone Volume",
+            ControlCommandIdentifiers::DisableButtonInput => "Disable Button Input",
+            ControlCommandIdentifiers::ExtendedHoldAndRelease => "Extended Hold And Release",
         };
         write!(f, "{}", name)
     }
@@ -584,9 +719,10 @@ impl AACPManager {
                         hex::encode(&value)
                     );
                 } else {
-                    error!(
-                        "Unknown Control Command identifier: {:#04x}",
-                        identifier_byte
+                    debug!(
+                        "Unknown Control Command identifier: {:#04x}, value: {}",
+                        identifier_byte,
+                        hex::encode(&value)
                     );
                 }
             }
@@ -1132,6 +1268,30 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_identifier_round_trips() {
+        for id in ControlCommandIdentifiers::ALL {
+            assert_eq!(ControlCommandIdentifiers::from_u8(*id as u8), Some(*id));
+        }
+    }
+
+    #[test]
+    fn android_ids_are_known() {
+        use ControlCommandIdentifiers::*;
+        assert_eq!(ControlCommandIdentifiers::from_u8(0x37), Some(PpeToggleConfig));
+        assert_eq!(ControlCommandIdentifiers::from_u8(0x3B), Some(DynamicEndOfCharge));
+        assert_eq!(ControlCommandIdentifiers::from_u8(0x08), Some(BudRole));
+    }
+
+    #[test]
+    fn catalog_has_no_duplicate_bytes() {
+        let bytes: std::collections::HashSet<u8> = ControlCommandIdentifiers::ALL
+            .iter()
+            .map(|id| *id as u8)
+            .collect();
+        assert_eq!(bytes.len(), ControlCommandIdentifiers::ALL.len());
+    }
 
     #[test]
     fn clearing_connection_state_forgets_ear_and_ownership() {
