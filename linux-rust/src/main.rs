@@ -2,6 +2,7 @@ mod audio;
 mod bluetooth;
 mod devices;
 mod media_controller;
+mod prefs;
 mod ui;
 mod utils;
 
@@ -11,6 +12,7 @@ use crate::bluetooth::le::{ConnectedAirPods, start_le_monitor};
 use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::DeviceData;
 use crate::devices::registry::DeviceRegistry;
+use crate::prefs::{PrefsStore, load_app_settings, migrate_legacy_stem_control, save_app_settings};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
 use crate::utils::{get_app_settings_path, get_devices_path};
@@ -79,6 +81,7 @@ fn main() -> iced::Result {
         };
     }
     env_logger::init();
+    migrate_app_settings();
 
     let (ui_tx, ui_rx) = unbounded_channel::<BluetoothUIMessage>();
 
@@ -406,6 +409,28 @@ async fn disconnect_airpods(
                 tray.listening_mode = None;
             })
             .await;
+    }
+}
+
+/// Moves the old global stem-press setting into each known AirPods' own stem actions, once.
+fn migrate_app_settings() {
+    let path = get_app_settings_path();
+    let mut settings = load_app_settings(&path);
+    let airpods_macs: Vec<String> = std::fs::read_to_string(get_devices_path())
+        .ok()
+        .and_then(|json| serde_json::from_str::<HashMap<String, DeviceData>>(&json).ok())
+        .map(|devices| {
+            devices
+                .into_iter()
+                .filter(|(_, data)| data.type_ == devices::enums::DeviceType::AirPods)
+                .map(|(mac, _)| mac)
+                .collect()
+        })
+        .unwrap_or_default();
+    if migrate_legacy_stem_control(&mut settings, &PrefsStore::at_default_path(), &airpods_macs)
+        && let Err(e) = save_app_settings(&path, &settings)
+    {
+        warn!("Could not save migrated app settings: {}", e);
     }
 }
 

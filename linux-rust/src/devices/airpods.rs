@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
+use crate::prefs::load_app_settings;
 use crate::utils::get_app_settings_path;
 
 pub struct AirPodsDevice {
@@ -91,15 +92,7 @@ impl AirPodsDevice {
             error!("Failed to request proximity keys: {}", e);
         }
 
-        let app_settings_path = get_app_settings_path();
-        let settings = std::fs::read_to_string(&app_settings_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let stem_control = settings
-            .clone()
-            .and_then(|v| v.get("stem_control").cloned())
-            .and_then(|s| serde_json::from_value(s).ok())
-            .unwrap_or(false);
+        let stem_control = load_app_settings(&get_app_settings_path()).stem_control;
 
         if stem_control {
             // Enable stem press detection (double and triple tap)

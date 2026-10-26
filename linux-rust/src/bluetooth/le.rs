@@ -9,6 +9,7 @@ use crate::bluetooth::proximity::{
 };
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::devices::models::AirPodsModel;
+use crate::prefs::parse_prefs;
 use crate::ui::tray::MyTray;
 use crate::utils::{get_devices_path, get_preferences_path};
 use bluer::monitor::{Monitor, MonitorEvent, Pattern};
@@ -120,10 +121,9 @@ impl AutoConnectGate {
 
 /// Auto-connect is opt-in per MAC in preferences.json (`{"<mac>": {"autoConnect": true}}`).
 pub fn auto_connect_enabled(prefs_json: &str, mac: &str) -> bool {
-    serde_json::from_str::<HashMap<String, HashMap<String, bool>>>(prefs_json)
-        .ok()
-        .and_then(|prefs| prefs.get(mac).and_then(|p| p.get("autoConnect")).copied())
-        .unwrap_or(false)
+    parse_prefs(prefs_json)
+        .get(mac)
+        .is_some_and(|prefs| prefs.auto_connect)
 }
 
 struct KnownAirPods {
@@ -595,5 +595,8 @@ mod tests {
         assert!(!auto_connect_enabled("not json", MAC));
         let enabled = format!(r#"{{"{MAC}":{{"autoConnect":true}}}}"#);
         assert!(auto_connect_enabled(&enabled, MAC));
+        // Stage 3 adds non-boolean and other keys next to autoConnect; they must not hide it.
+        let mixed = format!(r#"{{"{MAC}":{{"autoConnect":true,"earDetection":false,"conversationVolume":40}}}}"#);
+        assert!(auto_connect_enabled(&mixed, MAC));
     }
 }

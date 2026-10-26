@@ -9,6 +9,7 @@ use crate::devices::enums::{
 use crate::ui::airpods::airpods_view;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
+use crate::prefs::{load_app_settings, save_app_settings};
 use crate::utils::{MyTheme, get_app_settings_path, get_devices_path};
 use bluer::{Address};
 use iced::border::Radius;
@@ -147,25 +148,10 @@ impl App {
             (Some(id), open.map(Message::WindowOpened))
         };
 
-        let app_settings_path = get_app_settings_path();
-        let settings = std::fs::read_to_string(&app_settings_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let selected_theme = settings
-            .clone()
-            .and_then(|v| v.get("theme").cloned())
-            .and_then(|t| serde_json::from_value(t).ok())
-            .unwrap_or(MyTheme::Dark);
-        let tray_text_mode = settings
-            .clone()
-            .and_then(|v| v.get("tray_text_mode").cloned())
-            .and_then(|ttm| serde_json::from_value(ttm).ok())
-            .unwrap_or(false);
-        let stem_control = settings
-            .clone()
-            .and_then(|v| v.get("stem_control").cloned())
-            .and_then(|s| serde_json::from_value(s).ok())
-            .unwrap_or(false);
+        let app_settings = load_app_settings(&get_app_settings_path());
+        let selected_theme = app_settings.theme;
+        let tray_text_mode = app_settings.tray_text_mode;
+        let stem_control = app_settings.stem_control;
 
         let bluetooth_state = BluetoothState::new();
 
@@ -226,6 +212,19 @@ impl App {
         "LibrePods".to_string()
     }
 
+    /// Saves this window's settings on top of the file, so settings it doesn't show survive.
+    fn persist_app_settings(&self) {
+        let path = get_app_settings_path();
+        let mut settings = load_app_settings(&path);
+        settings.theme = self.selected_theme;
+        settings.tray_text_mode = self.tray_text_mode;
+        settings.stem_control = self.stem_control;
+        debug!("Writing settings to {}: {:?}", path.display(), settings);
+        if let Err(e) = save_app_settings(&path, &settings) {
+            error!("Failed to save app settings: {}", e);
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::WindowOpened(id) => {
@@ -248,18 +247,7 @@ impl App {
             }
             Message::ThemeSelected(theme) => {
                 self.selected_theme = theme;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                std::fs::write(app_settings_path, settings.to_string()).ok();
+                self.persist_app_settings();
                 Task::none()
             }
             Message::CopyToClipboard(data) => iced::clipboard::write(data),
@@ -626,34 +614,12 @@ impl App {
             }
             Message::TrayTextModeChanged(is_enabled) => {
                 self.tray_text_mode = is_enabled;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                std::fs::write(app_settings_path, settings.to_string()).ok();
+                self.persist_app_settings();
                 Task::none()
             }
             Message::StemControlChanged(is_enabled) => {
                 self.stem_control = is_enabled;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                std::fs::write(app_settings_path, settings.to_string()).ok();
+                self.persist_app_settings();
                 Task::none()
             }
         }
