@@ -11,6 +11,9 @@ use zbus::zvariant::Value;
 const LOW_BATTERY: u8 = 20;
 /// Back at or above this level (or charging), it may warn again.
 const REARM_BATTERY: u8 = 25;
+/// How long a notification call may take; a wedged notification server must not hold up
+/// the AirPods' event handling.
+const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct Notifier {
@@ -21,7 +24,20 @@ pub struct Notifier {
 
 impl Notifier {
     pub async fn connect() -> Option<Self> {
-        match zbus::Connection::session().await {
+        match zbus::connection::Builder::session() {
+            Ok(builder) => Self::from_builder(builder, NOTIFY_TIMEOUT).await,
+            Err(e) => {
+                warn!("Desktop notifications are unavailable: {}", e);
+                None
+            }
+        }
+    }
+
+    async fn from_builder(
+        builder: zbus::connection::Builder<'static>,
+        timeout: std::time::Duration,
+    ) -> Option<Self> {
+        match builder.method_timeout(timeout).build().await {
             Ok(connection) => Some(Notifier {
                 connection,
                 ids: Arc::new(Mutex::new(HashMap::new())),
@@ -31,6 +47,14 @@ impl Notifier {
                 None
             }
         }
+    }
+
+    /// Shows a notification without waiting for it: the caller's event loop never stalls on
+    /// the notification server.
+    pub fn show_detached(&self, key: &str, summary: &str, body: &str) {
+        let notifier = self.clone();
+        let (key, summary, body) = (key.to_string(), summary.to_string(), body.to_string());
+        tokio::spawn(async move { notifier.show(&key, &summary, &body).await });
     }
 
     pub async fn show(&self, key: &str, summary: &str, body: &str) {
@@ -149,6 +173,76 @@ mod tests {
             level,
             status,
         }
+    }
+
+    /// A notification server that accepts calls and never answers, like a wedged plasmashell.
+    struct SilentServer;
+
+    #[zbus::interface(name = "org.freedesktop.Notifications")]
+    impl SilentServer {
+        #[allow(clippy::too_many_arguments)]
+        async fn notify(
+            &self,
+            _app_name: String,
+            _replaces_id: u32,
+            _app_icon: String,
+            _summary: String,
+            _body: String,
+            _actions: Vec<String>,
+            _hints: HashMap<String, zbus::zvariant::OwnedValue>,
+            _expire_timeout: i32,
+        ) -> u32 {
+            std::future::pending::<()>().await;
+            0
+        }
+    }
+
+    async fn notifier_with_silent_server(
+        timeout: std::time::Duration,
+    ) -> (zbus::Connection, Notifier) {
+        let (server_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+        let server = async {
+            zbus::connection::Builder::unix_stream(server_side)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .serve_at("/org/freedesktop/Notifications", SilentServer)
+                .unwrap()
+                .build()
+                .await
+                .unwrap()
+        };
+        let client = Notifier::from_builder(
+            zbus::connection::Builder::unix_stream(client_side).p2p(),
+            timeout,
+        );
+        let (server, notifier) = tokio::join!(server, client);
+        (server, notifier.expect("the peer-to-peer client connects"))
+    }
+
+    #[tokio::test]
+    async fn show_gives_up_when_the_notification_server_hangs() {
+        let (_server, notifier) =
+            notifier_with_silent_server(std::time::Duration::from_millis(200)).await;
+        let shown = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            notifier.show("connect:test", "summary", "body"),
+        )
+        .await;
+        assert!(shown.is_ok(), "show() kept waiting for a server that never answers");
+    }
+
+    #[tokio::test]
+    async fn show_detached_returns_at_once() {
+        let (_server, notifier) =
+            notifier_with_silent_server(std::time::Duration::from_secs(30)).await;
+        let start = std::time::Instant::now();
+        notifier.show_detached("connect:test", "summary", "body");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
