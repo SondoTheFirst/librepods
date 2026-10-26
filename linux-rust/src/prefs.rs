@@ -3,7 +3,7 @@
 //! from older or newer versions, keep keys they don't know, and are replaced atomically.
 
 use crate::utils::{MyTheme, get_preferences_path};
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -141,11 +141,60 @@ impl Default for DevicePrefs {
     }
 }
 
+/// The keys of `object` that `T` accepts one at a time; a bad value drops only its own key.
+fn accepted_keys<T: DeserializeOwned>(object: &Map<String, Value>) -> Map<String, Value> {
+    object
+        .iter()
+        .filter(|(key, value)| {
+            let single = Map::from_iter([((*key).clone(), (*value).clone())]);
+            serde_json::from_value::<T>(Value::Object(single)).is_ok()
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// One device's preferences. A value this version can't read (a typo, a number out of range,
+/// a newer build's stem action) falls back to its default on its own; everything else is kept.
 fn device_from_value(mac: &str, value: Value) -> DevicePrefs {
-    serde_json::from_value(value).unwrap_or_else(|e| {
-        warn!("Preferences for {} are invalid ({}); using defaults", mac, e);
-        DevicePrefs::default()
-    })
+    let Value::Object(mut object) = value else {
+        debug!("Preferences for {} are not an object; using defaults", mac);
+        return DevicePrefs::default();
+    };
+    if let Some(Value::Object(slots)) = object.get("stemActions") {
+        let accepted = accepted_keys::<StemActions>(slots);
+        object.insert("stemActions".to_string(), Value::Object(accepted));
+    }
+    let accepted = accepted_keys::<DevicePrefs>(&object);
+    if accepted.len() != object.len() {
+        let ignored: Vec<&String> = object.keys().filter(|key| !accepted.contains_key(*key)).collect();
+        debug!("Preferences for {}: ignoring unreadable {:?}", mac, ignored);
+    }
+    serde_json::from_value(Value::Object(accepted)).unwrap_or_default()
+}
+
+/// Writes only what a change touched: values the change left alone stay exactly as they were in
+/// the file, even ones this version can't read, and untouched defaults are not added.
+fn merge_changes(raw: Value, before: &Value, after: &Value) -> Value {
+    if before == after {
+        return raw;
+    }
+    match (raw, before, after) {
+        (Value::Object(mut raw), Value::Object(before), Value::Object(after)) => {
+            for (key, after_value) in after {
+                let before_value = before.get(key).unwrap_or(&Value::Null);
+                if before_value == after_value {
+                    continue;
+                }
+                let merged = match raw.remove(key) {
+                    Some(raw_value) => merge_changes(raw_value, before_value, after_value),
+                    None => after_value.clone(),
+                };
+                raw.insert(key.clone(), merged);
+            }
+            Value::Object(raw)
+        }
+        (_, _, after) => after.clone(),
+    }
 }
 
 /// Every device entry in a preferences file. A bad entry gets the defaults; the others are kept.
@@ -219,13 +268,13 @@ impl PrefsStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
             Err(e) => return Err(e),
         };
-        let mut prefs = entries
-            .remove(mac)
-            .map(|value| device_from_value(mac, value))
-            .unwrap_or_default();
-        f(&mut prefs);
-        let value = serde_json::to_value(&prefs).map_err(std::io::Error::other)?;
-        entries.insert(mac.to_string(), value);
+        let raw = entries.remove(mac).unwrap_or_else(|| Value::Object(Map::new()));
+        let before = device_from_value(mac, raw.clone());
+        let mut after = before.clone();
+        f(&mut after);
+        let before = serde_json::to_value(&before).map_err(std::io::Error::other)?;
+        let after = serde_json::to_value(&after).map_err(std::io::Error::other)?;
+        entries.insert(mac.to_string(), merge_changes(raw, &before, &after));
         write_json_atomically(&self.path, &Value::Object(entries))
     }
 }
@@ -414,6 +463,73 @@ mod tests {
             "{oops"
         );
         assert!(store.device(MAC).auto_connect);
+    }
+
+    #[test]
+    fn one_bad_field_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = store_in(&dir);
+        std::fs::write(
+            &path,
+            format!(r#"{{"{MAC}":{{"autoConnect":true,"conversationVolume":300,"earDetection":false,"stemActions":{{"leftDouble":{{"action":"futureAction"}},"rightTriple":{{"action":"nextTrack"}}}}}}}}"#),
+        )
+        .unwrap();
+        let prefs = store.device(MAC);
+        assert!(prefs.auto_connect);
+        assert!(!prefs.ear_detection);
+        assert_eq!(prefs.conversation_volume, 25);
+        assert_eq!(prefs.stem_actions.right_triple, StemAction::NextTrack);
+        assert_eq!(prefs.stem_actions.left_double, StemAction::Native);
+    }
+
+    #[test]
+    fn bad_and_unknown_values_survive_an_unrelated_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = store_in(&dir);
+        std::fs::write(
+            &path,
+            format!(r#"{{"{MAC}":{{"autoConnect":true,"conversationVolume":300,"futureKey":1,"stemActions":{{"leftDouble":{{"action":"futureAction"}},"rightTriple":{{"action":"nextTrack"}}}}}}}}"#),
+        )
+        .unwrap();
+        store.update(MAC, |p| p.takeover_from_call = true).unwrap();
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file[MAC]["takeoverFromCall"], true);
+        assert_eq!(file[MAC]["autoConnect"], true);
+        assert_eq!(file[MAC]["conversationVolume"], 300);
+        assert_eq!(file[MAC]["futureKey"], 1);
+        assert_eq!(file[MAC]["stemActions"]["leftDouble"], json!({"action": "futureAction"}));
+        assert_eq!(file[MAC]["stemActions"]["rightTriple"], json!({"action": "nextTrack"}));
+    }
+
+    #[test]
+    fn changing_one_stem_slot_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = store_in(&dir);
+        std::fs::write(
+            &path,
+            format!(r#"{{"{MAC}":{{"stemActions":{{"leftDouble":{{"action":"futureAction"}},"rightTriple":{{"action":"nextTrack"}}}}}}}}"#),
+        )
+        .unwrap();
+        store
+            .update(MAC, |p| p.stem_actions.left_long = StemAction::PlayPause)
+            .unwrap();
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let slots = &file[MAC]["stemActions"];
+        assert_eq!(slots["leftLong"], json!({"action": "playPause"}));
+        assert_eq!(slots["leftDouble"], json!({"action": "futureAction"}));
+        assert_eq!(slots["rightTriple"], json!({"action": "nextTrack"}));
+    }
+
+    #[test]
+    fn only_changed_settings_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = store_in(&dir);
+        store.update(MAC, |p| p.auto_connect = true).unwrap();
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file[MAC], json!({"autoConnect": true}));
     }
 
     #[test]
