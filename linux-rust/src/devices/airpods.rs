@@ -4,6 +4,7 @@ use crate::bluetooth::battery_provider::{BatteryReporter, system_battery_percent
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
 use crate::devices::registry::ManagedDevice;
 use crate::media_controller::MediaController;
+use crate::prefs::PrefsStore;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
 use bluer::Address;
@@ -27,13 +28,26 @@ pub struct AirPodsDevice {
     battery_reporter: Option<BatteryReporter>,
 }
 
+/// What every AirPods instance shares with the rest of the app.
+#[derive(Clone)]
+pub struct DeviceContext {
+    pub tray_handle: Option<Handle<MyTray>>,
+    pub ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
+    pub battery_reporter: Option<BatteryReporter>,
+    pub prefs: PrefsStore,
+}
+
+/// How long local playback leaves the AirPods alone after another device takes them.
+const TAKEOVER_SUPPRESSION: Duration = Duration::from_secs(3);
+
 impl AirPodsDevice {
-    pub async fn new(
-        mac_address: Address,
-        tray_handle: Option<Handle<MyTray>>,
-        ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
-        battery_reporter: Option<BatteryReporter>,
-    ) -> Option<Self> {
+    pub async fn new(mac_address: Address, ctx: DeviceContext) -> Option<Self> {
+        let DeviceContext {
+            tray_handle,
+            ui_tx,
+            battery_reporter,
+            prefs,
+        } = ctx;
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
         if !aacp_manager.connect(mac_address).await {
@@ -121,6 +135,7 @@ impl AirPodsDevice {
             mac_address.to_string(),
             local_mac.clone(),
             Arc::new(SystemAudioBackend),
+            prefs,
         );
         let mc_clone = media_controller.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -220,6 +235,7 @@ impl AirPodsDevice {
                 let owns = value.first().copied().unwrap_or(0) != 0;
                 if !owns {
                     info!("Lost ownership, pausing media and disconnecting audio");
+                    mc_clone_owns.suppress_takeover(TAKEOVER_SUPPRESSION).await;
                     mc_clone_owns.pause_all_media().await;
                     mc_clone_owns.deactivate_a2dp_profile().await;
                 }
@@ -349,6 +365,7 @@ impl AirPodsDevice {
                         );
                         let _ = command_tx_clone
                             .send((ControlCommandIdentifiers::OwnsConnection, vec![0x00]));
+                        mc_clone.suppress_takeover(TAKEOVER_SUPPRESSION).await;
                         mc_clone.pause_all_media().await;
                         mc_clone.deactivate_a2dp_profile().await;
                     }

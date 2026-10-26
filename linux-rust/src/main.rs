@@ -22,7 +22,7 @@ use dbus::arg::{RefArg, Variant};
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use dbus::message::MatchRule;
-use devices::airpods::AirPodsDevice;
+use devices::airpods::{AirPodsDevice, DeviceContext};
 use ksni::TrayMethods;
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -166,6 +166,12 @@ async fn async_main(
     let aacp_connected = Arc::new(aacp_connected_tx);
     let connected_airpods = Arc::new(std::sync::Mutex::new(ConnectedAirPods::default()));
     let battery_reporter = BatteryReporter::register().await;
+    let device_context = DeviceContext {
+        tray_handle: tray_handle.clone(),
+        ui_tx: ui_tx.clone(),
+        battery_reporter,
+        prefs: PrefsStore::at_default_path(),
+    };
 
     info!("Listening for new connections.");
 
@@ -186,10 +192,8 @@ async fn async_main(
             connect_airpods(
                 airpods.clone(),
                 device.address(),
-                tray_handle.clone(),
-                ui_tx.clone(),
+                device_context.clone(),
                 device_managers.clone(),
-                battery_reporter.clone(),
             )
             .await;
         }
@@ -341,10 +345,8 @@ async fn async_main(
         tokio::spawn(connect_airpods(
             airpods.clone(),
             addr,
-            tray_handle.clone(),
-            ui_tx.clone(),
+            device_context.clone(),
             device_managers.clone(),
-            battery_reporter.clone(),
         ));
         true
     })?;
@@ -359,17 +361,15 @@ async fn async_main(
 async fn connect_airpods(
     registry: DeviceRegistry<AirPodsDevice>,
     addr: Address,
-    tray_handle: Option<ksni::Handle<MyTray>>,
-    ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
+    ctx: DeviceContext,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
-    battery_reporter: Option<BatteryReporter>,
 ) {
     let mac = addr.to_string();
     let addr_str = mac.clone();
     registry
         .connect_with(&mac, move || async move {
-            let device =
-                AirPodsDevice::new(addr, tray_handle, ui_tx.clone(), battery_reporter).await?;
+            let ui_tx = ctx.ui_tx.clone();
+            let device = AirPodsDevice::new(addr, ctx).await?;
             let mut managers = device_managers.write().await;
             // let dev_managers = DeviceManagers::with_both(device.aacp_manager.clone(), device.att_manager.clone());
             managers
