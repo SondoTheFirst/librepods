@@ -15,6 +15,7 @@ use log::{info, warn};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::fdo;
@@ -23,6 +24,10 @@ use zbus::interface;
 pub const BUS_NAME: &str = "me.kavishdevar.librepods";
 pub const OBJECT_PATH: &str = "/me/kavishdevar/librepods";
 const INTERFACE: &str = "me.kavishdevar.librepods.Control1";
+/// How long `ctl` waits for the running app.
+const CTL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a second launch waits before giving up on the running app.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(clap::Subcommand, Debug)]
 pub enum CtlCommand {
@@ -330,6 +335,20 @@ pub async fn serve(
     }
 }
 
+/// A session-bus connection whose calls give up after `timeout`, so a stuck LibrePods can't
+/// make `ctl` or a second launch hang.
+async fn control_connection(
+    builder: zbus::connection::Builder<'static>,
+    timeout: Duration,
+) -> zbus::Result<zbus::Connection> {
+    builder.method_timeout(timeout).build().await
+}
+
+/// Asks the running LibrePods to show its window.
+async fn open_window_on(connection: &zbus::Connection) -> Result<(), String> {
+    call(connection, "OpenWindow", &()).await.map(|_| ())
+}
+
 async fn running_instance(connection: &zbus::Connection) -> Result<bool, String> {
     let dbus = fdo::DBusProxy::new(connection)
         .await
@@ -358,7 +377,9 @@ where
 }
 
 async fn ctl(args: CtlArgs) -> Result<String, String> {
-    let connection = zbus::Connection::session()
+    let builder = zbus::connection::Builder::session()
+        .map_err(|e| format!("could not reach the session bus: {}", e))?;
+    let connection = control_connection(builder, CTL_TIMEOUT)
         .await
         .map_err(|e| format!("could not reach the session bus: {}", e))?;
     if !running_instance(&connection).await? {
@@ -432,21 +453,30 @@ pub fn run_ctl(args: CtlArgs) -> i32 {
     }
 }
 
-/// If LibrePods is already running, asks it to show its window and returns true, so this
-/// launch can exit instead of starting a second instance.
-pub fn hand_over_to_running_instance() -> bool {
+/// If LibrePods is already running, returns true so this launch exits instead of starting a
+/// second instance; with `show_window` (an ordinary launch, not autostart) it first asks the
+/// running one to show its window. Every step gives up after a few seconds.
+pub fn hand_over_to_running_instance(show_window: bool) -> bool {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
         return false;
     };
     runtime.block_on(async {
-        let Ok(connection) = zbus::Connection::session().await else {
+        let connect = async {
+            let builder = zbus::connection::Builder::session().ok()?;
+            control_connection(builder, HANDOVER_TIMEOUT).await.ok()
+        };
+        let Ok(Some(connection)) = tokio::time::timeout(HANDOVER_TIMEOUT, connect).await else {
             return false;
         };
         if !matches!(running_instance(&connection).await, Ok(true)) {
             return false;
         }
-        match call(&connection, "OpenWindow", &()).await {
-            Ok(_) => info!("LibrePods is already running; showed its window"),
+        if !show_window {
+            info!("LibrePods is already running; not starting another");
+            return true;
+        }
+        match open_window_on(&connection).await {
+            Ok(()) => info!("LibrePods is already running; showed its window"),
             Err(e) => warn!("LibrePods is already running ({}); not starting another", e),
         }
         true
@@ -461,6 +491,40 @@ mod tests {
     use crate::devices::settings::ListeningMode;
 
     const A: &str = "8C:7A:AA:D0:3B:50";
+
+    /// A LibrePods that accepts calls and never answers, like a wedged instance.
+    struct StuckApp;
+
+    #[zbus::interface(name = "me.kavishdevar.librepods.Control1")]
+    impl StuckApp {
+        async fn open_window(&self) {
+            std::future::pending::<()>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn asking_a_stuck_app_for_its_window_gives_up() {
+        let (server_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+        let server = async {
+            zbus::connection::Builder::unix_stream(server_side)
+                .server(zbus::Guid::generate())
+                .unwrap()
+                .p2p()
+                .serve_at(OBJECT_PATH, StuckApp)
+                .unwrap()
+                .build()
+                .await
+                .unwrap()
+        };
+        let client = control_connection(
+            zbus::connection::Builder::unix_stream(client_side).p2p(),
+            Duration::from_millis(200),
+        );
+        let (_server, client) = tokio::join!(server, client);
+        let client = client.unwrap();
+        let asked = tokio::time::timeout(Duration::from_secs(3), open_window_on(&client)).await;
+        assert!(matches!(asked, Ok(Err(_))), "asking a stuck app hung: {:?}", asked);
+    }
     const B: &str = "11:22:33:44:55:66";
 
     #[test]
