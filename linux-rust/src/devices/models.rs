@@ -183,13 +183,11 @@ impl AirPodsModel {
         }
     }
 
-    #[allow(dead_code)] // first used by the Stage 3 settings page
     pub fn has(&self, capability: Capability) -> bool {
         self.capabilities().contains(&capability)
     }
 
     /// Over-ear models report a single "headphone" battery instead of left/right/case.
-    #[allow(dead_code)] // first used by the Stage 3 settings page
     pub fn is_headset(&self) -> bool {
         matches!(
             self,
