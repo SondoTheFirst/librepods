@@ -1,5 +1,5 @@
 use crate::bluetooth::aacp::AACPManager;
-use crate::bluetooth::aacp::EarDetectionStatus;
+use crate::bluetooth::aacp::{ControlCommandIdentifiers, EarDetectionStatus};
 use crate::audio::{
     A2dpAction, AudioBackend, find_bluez_card, get_sink_name_by_mac,
     get_sink_volume_percent_by_name_sync, plan_a2dp_activation, transition_sink_volume,
@@ -23,7 +23,6 @@ struct MediaControllerState {
     disconnect_when_not_wearing: bool,
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
-    playback_listener_running: bool,
 }
 
 impl MediaControllerState {
@@ -40,7 +39,6 @@ impl MediaControllerState {
             disconnect_when_not_wearing: true,
             conv_original_volume: None,
             conv_conversation_started: false,
-            playback_listener_running: false,
         }
     }
 }
@@ -76,37 +74,10 @@ impl MediaController {
         self
     }
 
-    pub async fn start_playback_listener(
-        &self,
+    pub async fn run_playback_listener(
+        self,
         aacp_manager: AACPManager,
-        control_tx: tokio::sync::mpsc::UnboundedSender<(
-            crate::bluetooth::aacp::ControlCommandIdentifiers,
-            Vec<u8>,
-        )>,
-    ) {
-        let mut state = self.state.lock().await;
-        if state.playback_listener_running {
-            debug!("Playback listener already running");
-            return;
-        }
-        state.playback_listener_running = true;
-        drop(state);
-
-        let controller_clone = self.clone();
-        tokio::spawn(async move {
-            controller_clone
-                .playback_listener_loop(aacp_manager, control_tx)
-                .await;
-        });
-    }
-
-    async fn playback_listener_loop(
-        &self,
-        aacp_manager: AACPManager,
-        control_tx: tokio::sync::mpsc::UnboundedSender<(
-            crate::bluetooth::aacp::ControlCommandIdentifiers,
-            Vec<u8>,
-        )>,
+        control_tx: tokio::sync::mpsc::UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>,
     ) {
         info!("Starting playback listener loop");
         loop {
@@ -123,26 +94,26 @@ impl MediaController {
             drop(state);
 
             if !was_playing && is_playing {
-                let aacp_state = aacp_manager.state.lock().await;
-                if !aacp_state
-                    .ear_detection_status
-                    .contains(&EarDetectionStatus::InEar)
-                {
+                // Copy what we need and release the AACP lock before sending anything:
+                // sending packets locks the same state.
+                let (ear_status, connected_devices) = {
+                    let aacp_state = aacp_manager.state.lock().await;
+                    (
+                        aacp_state.ear_detection_status.clone(),
+                        aacp_state.connected_devices.clone(),
+                    )
+                };
+                if !should_take_over(was_playing, is_playing, &ear_status) {
                     info!("Media playback started but buds not in ear, skipping takeover");
                     continue;
                 }
                 info!("Media playback started, taking ownership and activating a2dp");
-                let _ = control_tx.send((
-                    crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
-                    vec![0x01],
-                ));
+                let _ = control_tx.send((ControlCommandIdentifiers::OwnsConnection, vec![0x01]));
                 self.activate_a2dp_profile().await;
 
-                info!("already connected locally, hijacking connection by asking AirPods");
-
-                let connected_devices = aacp_state.connected_devices.clone();
                 for device in connected_devices {
                     if device.mac != local_mac {
+                        info!("Asking {} to hand over the AirPods", device.mac);
                         if let Err(e) = aacp_manager
                             .send_media_information(&local_mac, &device.mac, true)
                             .await
@@ -745,6 +716,11 @@ impl MediaController {
     }
 }
 
+/// Take the AirPods over only when playback just started and at least one bud is in an ear.
+pub fn should_take_over(was_playing: bool, is_playing: bool, ear: &[EarDetectionStatus]) -> bool {
+    !was_playing && is_playing && ear.contains(&EarDetectionStatus::InEar)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +866,29 @@ mod tests {
             *backend.set_calls.lock().unwrap(),
             vec![(1043, "off".to_string())]
         );
+    }
+
+    #[test]
+    fn takes_over_on_rising_edge_with_a_bud_in_ear() {
+        use EarDetectionStatus::*;
+        assert!(should_take_over(false, true, &[InEar, OutOfEar]));
+    }
+
+    #[test]
+    fn no_takeover_when_buds_out() {
+        use EarDetectionStatus::*;
+        assert!(!should_take_over(false, true, &[OutOfEar, InCase]));
+    }
+
+    #[test]
+    fn no_takeover_when_already_playing() {
+        use EarDetectionStatus::*;
+        assert!(!should_take_over(true, true, &[InEar, InEar]));
+    }
+
+    #[test]
+    fn no_takeover_without_ear_data() {
+        assert!(!should_take_over(false, true, &[]));
     }
 
     #[tokio::test]

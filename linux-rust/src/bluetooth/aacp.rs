@@ -1218,12 +1218,15 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
             Err(e) => {
                 debug!("Read error: {}", e);
                 info!(
-                    "We have probably disconnected, clearing state variables (owns=false, connected_devices=empty, control_command_status_list=empty)."
+                    "We have probably disconnected, clearing state variables (owns, connected devices, control commands, ear detection, audio source)."
                 );
                 let mut state = manager.state.lock().await;
                 state.owns = false;
                 state.connected_devices.clear();
                 state.control_command_status_list.clear();
+                state.ear_detection_status.clear();
+                state.old_ear_detection_status.clear();
+                state.audio_source = None;
                 break;
             }
         }
