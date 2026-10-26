@@ -34,25 +34,40 @@ pub fn get_app_settings_path() -> PathBuf {
     let data_dir = std::env::var("XDG_DATA_HOME")
         .unwrap_or_else(|_| format!("{}/.local/share", home));
 
-    let new_path = PathBuf::from(&config_dir)
-        .join("librepods")
-        .join("app_settings.json");
+    app_settings_path_in(Path::new(&config_dir), Path::new(&data_dir))
+}
 
-    let old_path = PathBuf::from(&data_dir)
-        .join("app_settings.json");
-
-    // migrate if needed
-    if old_path.exists() && !new_path.exists() {
-        if let Some(parent) = new_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        if std::fs::copy(&old_path, &new_path).is_ok() {
-            let _ = std::fs::remove_file(&old_path);
+/// `config_dir/librepods/app_settings.json`. When it doesn't exist yet, settings an older
+/// version left behind are copied there; the old file stays, so older AppImages keep working.
+pub fn app_settings_path_in(config_dir: &Path, data_dir: &Path) -> PathBuf {
+    let path = config_dir.join("librepods").join("app_settings.json");
+    if path.exists() {
+        return path;
+    }
+    let legacy = [
+        // 0.1.0 used the data directory when XDG_CONFIG_HOME was unset.
+        data_dir.join("librepods").join("app_settings.json"),
+        data_dir.join("app_settings.json"),
+    ];
+    if let Some(old) = legacy.iter().find(|candidate| candidate.exists()) {
+        let copied = std::fs::read(old).and_then(|content| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, content)?;
+            std::fs::rename(&tmp, &path)
+        });
+        match copied {
+            Ok(()) => log::info!(
+                "Copied app settings from {} to {}",
+                old.display(),
+                path.display()
+            ),
+            Err(e) => log::warn!("Could not copy app settings from {}: {}", old.display(), e),
         }
     }
-
-    new_path
+    path
 }
 
 /// Read-modify-write of one entry in devices.json. Re-reads the file every time so other
@@ -295,6 +310,28 @@ mod tests {
         };
         apply_le_key(&mut data, ProximityKeyType::Irk, "00ff");
         assert_eq!(airpods_info(&data).le_keys.irk, "00ff");
+    }
+
+    #[test]
+    fn app_settings_from_0_1_0_are_copied() {
+        let config = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let old = data.path().join("librepods").join("app_settings.json");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, r#"{"theme":"TokyoNightStorm"}"#).unwrap();
+
+        let path = app_settings_path_in(config.path(), data.path());
+        assert_eq!(path, config.path().join("librepods").join("app_settings.json"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"theme":"TokyoNightStorm"}"#
+        );
+        assert!(old.exists(), "the 0.1.0 file must stay for the old AppImage");
+
+        // Settings already at the new path are never replaced by stale old ones.
+        std::fs::write(&path, r#"{"theme":"Nord"}"#).unwrap();
+        app_settings_path_in(config.path(), data.path());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"theme":"Nord"}"#);
     }
 
     #[test]
