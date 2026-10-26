@@ -155,15 +155,10 @@ async fn async_main(
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
-    let le_tray_clone = tray_handle.clone();
-    tokio::spawn(async move {
-        info!("Starting LE monitor...");
-        if let Err(e) = start_le_monitor(le_tray_clone).await {
-            log::error!("LE monitor error: {}", e);
-        }
-    });
-
     let airpods: DeviceRegistry<AirPodsDevice> = DeviceRegistry::new();
+    // Whether any AirPods hold an AACP connection; the BLE scanner only scans actively when not.
+    let (aacp_connected_tx, aacp_connected_rx) = tokio::sync::watch::channel(false);
+    let aacp_connected = Arc::new(aacp_connected_tx);
 
     info!("Listening for new connections.");
 
@@ -181,6 +176,7 @@ async fn async_main(
                 tray_handle.clone(),
                 ui_tx.clone(),
                 device_managers.clone(),
+                aacp_connected.clone(),
             )
             .await;
         }
@@ -188,6 +184,15 @@ async fn async_main(
             info!("No connected AirPods found.");
         }
     }
+
+    // Started after the initial check so it never scans while already-connected AirPods come up.
+    let le_tray_clone = tray_handle.clone();
+    tokio::spawn(async move {
+        info!("Starting LE monitor...");
+        if let Err(e) = start_le_monitor(le_tray_clone, aacp_connected_rx).await {
+            log::error!("LE monitor error: {}", e);
+        }
+    });
 
     match find_other_managed_devices(&adapter, managed_devices_mac.clone()).await {
         Ok(devices) => {
@@ -281,6 +286,7 @@ async fn async_main(
                 airpods.clone(),
                 addr_str.clone(),
                 tray_handle.clone(),
+                aacp_connected.clone(),
             ));
             return true;
         }
@@ -324,6 +330,7 @@ async fn async_main(
             tray_handle.clone(),
             ui_tx.clone(),
             device_managers.clone(),
+            aacp_connected.clone(),
         ));
         true
     })?;
@@ -341,10 +348,11 @@ async fn connect_airpods(
     tray_handle: Option<ksni::Handle<MyTray>>,
     ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
+    aacp_connected: Arc<tokio::sync::watch::Sender<bool>>,
 ) {
     let mac = addr.to_string();
     let addr_str = mac.clone();
-    registry
+    let registered = registry
         .connect_with(&mac, move || async move {
             let device = AirPodsDevice::new(addr, tray_handle, ui_tx.clone()).await?;
             let mut managers = device_managers.write().await;
@@ -360,6 +368,9 @@ async fn connect_airpods(
             Some(device)
         })
         .await;
+    if registered {
+        aacp_connected.send_replace(true);
+    }
 }
 
 /// Tears down the AirPods instance for `mac` and clears its state from the tray.
@@ -367,10 +378,12 @@ async fn disconnect_airpods(
     registry: DeviceRegistry<AirPodsDevice>,
     mac: String,
     tray_handle: Option<ksni::Handle<MyTray>>,
+    aacp_connected: Arc<tokio::sync::watch::Sender<bool>>,
 ) {
     if !registry.disconnect(&mac).await {
         return;
     }
+    aacp_connected.send_replace(false);
     if let Some(handle) = tray_handle {
         handle
             .update(|tray: &mut MyTray| {
