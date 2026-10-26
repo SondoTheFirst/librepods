@@ -1,5 +1,6 @@
 use crate::audio::SystemAudioBackend;
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
+use crate::bluetooth::battery_provider::{BatteryReporter, system_battery_percent};
 use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
 use crate::devices::registry::ManagedDevice;
 use crate::media_controller::MediaController;
@@ -22,6 +23,7 @@ pub struct AirPodsDevice {
     // pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>>,
     /// Every background loop of this instance; aborted on shutdown.
     tasks: JoinSet<()>,
+    battery_reporter: Option<BatteryReporter>,
 }
 
 impl AirPodsDevice {
@@ -29,6 +31,7 @@ impl AirPodsDevice {
         mac_address: Address,
         tray_handle: Option<Handle<MyTray>>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
+        battery_reporter: Option<BatteryReporter>,
     ) -> Option<Self> {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
@@ -231,6 +234,7 @@ impl AirPodsDevice {
         });
 
         let aacp_manager_clone_events = aacp_manager.clone();
+        let battery_reporter_events = battery_reporter.clone();
         let local_mac_events = local_mac.clone();
         let ui_tx_clone = ui_tx.clone();
         let command_tx_clone = command_tx.clone();
@@ -281,6 +285,11 @@ impl AirPodsDevice {
                                 .await;
                         }
                         debug!("Updated tray with new battery info");
+                        if let Some(reporter) = &battery_reporter_events
+                            && let Some(percent) = system_battery_percent(&battery_info)
+                        {
+                            reporter.update(&mac_address.to_string(), percent).await;
+                        }
 
                         let _ = ui_tx_clone.send(BluetoothUIMessage::AACPUIEvent(
                             mac_address.to_string(),
@@ -394,6 +403,7 @@ impl AirPodsDevice {
             media_controller,
             // command_tx: Some(command_tx.clone()),
             tasks,
+            battery_reporter,
         })
     }
 }
@@ -415,6 +425,9 @@ impl ManagedDevice for AirPodsDevice {
             self.tasks.abort_all();
             while self.tasks.join_next().await.is_some() {}
             self.aacp_manager.disconnect().await;
+            if let Some(reporter) = &self.battery_reporter {
+                reporter.remove(&self.mac_address.to_string()).await;
+            }
         }
     }
 }
