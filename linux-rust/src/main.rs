@@ -1,5 +1,6 @@
 mod audio;
 mod bluetooth;
+mod control;
 mod devices;
 mod media_controller;
 mod prefs;
@@ -50,11 +51,19 @@ struct Args {
     )]
     le_debug: bool,
     #[arg(long, short = 'v', help = "Show application version and exit")]
-    version: bool
+    version: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Control the running LibrePods from a terminal.
+    Ctl(control::CtlArgs),
 }
 
 fn main() -> iced::Result {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     if args.version {
         println!(
@@ -62,6 +71,11 @@ fn main() -> iced::Result {
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
+    }
+
+    // `librepods ctl …` only talks to the running app; it never starts one.
+    if let Some(Command::Ctl(ctl)) = args.command.take() {
+        std::process::exit(control::run_ctl(ctl));
     }
 
     let log_level = if args.debug { "debug" } else { "info" };
@@ -82,6 +96,12 @@ fn main() -> iced::Result {
         };
     }
     env_logger::init();
+
+    // A second launch (say, from the taskbar) shows the running LibrePods instead of starting
+    // another instance that would compete for the same AirPods.
+    if control::hand_over_to_running_instance() {
+        return Ok(());
+    }
     migrate_app_settings();
 
     let (ui_tx, ui_rx) = unbounded_channel::<BluetoothUIMessage>();
@@ -180,6 +200,13 @@ async fn async_main(
         prefs: PrefsStore::at_default_path(),
         notifier: Notifier::connect().await,
     };
+    // Kept for the life of the app: `librepods ctl` and second launches talk to it.
+    let _control = control::serve(
+        device_managers.clone(),
+        device_context.prefs.clone(),
+        Some(ui_tx.clone()),
+    )
+    .await;
 
     info!("Listening for new connections.");
 
@@ -458,4 +485,32 @@ fn set_airpods_connected(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .set(mac, connected);
     aacp_connected.send_replace(any);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctl_subcommand_parses() {
+        let args = Args::try_parse_from([
+            "librepods",
+            "ctl",
+            "mode",
+            "anc",
+            "--mac",
+            "AA:BB:CC:DD:EE:01",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Ctl(ctl)) => {
+                assert_eq!(ctl.mac.as_deref(), Some("AA:BB:CC:DD:EE:01"));
+                assert!(matches!(ctl.command, control::CtlCommand::Mode { ref mode } if mode == "anc"));
+            }
+            _ => panic!("expected the ctl subcommand"),
+        }
+        let plain = Args::try_parse_from(["librepods", "--start-minimized"]).unwrap();
+        assert!(plain.command.is_none());
+        assert!(plain.start_minimized);
+    }
 }
