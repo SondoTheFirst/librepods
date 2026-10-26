@@ -121,6 +121,7 @@ impl<D: ManagedDevice> DeviceRegistry<D> {
         }
     }
 
+    #[cfg(test)]
     pub async fn is_live(&self, mac: &str) -> bool {
         matches!(
             self.inner.lock().await.slots.get(mac),

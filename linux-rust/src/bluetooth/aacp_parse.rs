@@ -13,7 +13,9 @@ pub fn parse_battery(payload: &[u8]) -> Option<Vec<BatteryInfo>> {
     let count = *payload.get(2)? as usize;
     let entries = payload.get(3..3 + count * 5)?;
     let batteries = entries
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .filter_map(|entry| {
             let component = match entry[0] {
                 0x01 => BatteryComponent::Headphone,
@@ -102,7 +104,9 @@ pub fn parse_connected_devices(payload: &[u8]) -> Option<Vec<ConnectedDevice>> {
     let entries = payload.get(5..5 + count * 8)?;
     Some(
         entries
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|entry| ConnectedDevice {
                 mac: entry[..6]
                     .iter()
