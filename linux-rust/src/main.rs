@@ -104,7 +104,12 @@ fn main() -> iced::Result {
                 .unwrap();
         });
 
-        ui::window::start_ui(ui_rx, args.start_minimized, device_managers)
+        ui::window::start_ui(
+            ui_rx,
+            args.start_minimized,
+            device_managers,
+            PrefsStore::at_default_path(),
+        )
     }
 }
 
