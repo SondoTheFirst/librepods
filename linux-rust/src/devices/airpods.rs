@@ -9,8 +9,11 @@ use crate::devices::commands::{
     run_command,
 };
 use crate::prefs::{PrefsStore, StemAction};
+use crate::prefs::load_app_settings;
 use crate::ui::messages::BluetoothUIMessage;
+use crate::ui::notifications::{LowBatteryTracker, Notifier, battery_summary, low_battery_text};
 use crate::ui::tray::MyTray;
+use crate::utils::{get_app_settings_path, get_devices_path};
 use bluer::Address;
 use ksni::Handle;
 use log::{debug, error, info};
@@ -37,6 +40,7 @@ pub struct DeviceContext {
     pub ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
     pub battery_reporter: Option<BatteryReporter>,
     pub prefs: PrefsStore,
+    pub notifier: Option<Notifier>,
 }
 
 /// How long local playback leaves the AirPods alone after another device takes them.
@@ -49,6 +53,7 @@ impl AirPodsDevice {
             ui_tx,
             battery_reporter,
             prefs,
+            notifier,
         } = ctx;
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
@@ -244,6 +249,10 @@ impl AirPodsDevice {
         let command_tx_clone = command_tx.clone();
         let prefs_events = prefs.clone();
         tasks.spawn(async move {
+            let mac = mac_address.to_string();
+            // Desktop notifications are per connection: one "connected", one per low bud.
+            let mut announced_connect = false;
+            let mut low_battery = LowBatteryTracker::default();
             while let Some(event) = rx.recv().await {
                 let event_clone = event.clone();
                 match event {
@@ -301,6 +310,48 @@ impl AirPodsDevice {
                             event_clone,
                         ));
                         debug!("Sent BatteryInfo event to UI");
+
+                        if let Some(notifier) = &notifier {
+                            let settings = load_app_settings(&get_app_settings_path());
+                            let name = saved_name(&mac).unwrap_or_else(|| "AirPods".to_string());
+                            if !announced_connect {
+                                announced_connect = true;
+                                if settings.notify_on_connect {
+                                    notifier
+                                        .show(
+                                            &format!("connect:{}", mac),
+                                            &format!("{} connected", name),
+                                            &battery_summary(&battery_info),
+                                        )
+                                        .await;
+                                }
+                            }
+                            for component in low_battery.check(&battery_info) {
+                                if settings.notify_low_battery
+                                    && let Some(battery) =
+                                        battery_info.iter().find(|b| b.component == component)
+                                {
+                                    notifier
+                                        .show(
+                                            &format!("battery:{}", mac),
+                                            &low_battery_text(&name, battery),
+                                            "Charge them soon.",
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    AACPEvent::DeviceInfo { model, .. } => {
+                        if let Some(handle) = &tray_handle {
+                            handle
+                                .update(|tray: &mut MyTray| tray.model = Some(model))
+                                .await;
+                        }
+                        let _ = ui_tx_clone.send(BluetoothUIMessage::AACPUIEvent(
+                            mac_address.to_string(),
+                            event_clone,
+                        ));
                     }
                     AACPEvent::ControlCommand(status) => {
                         debug!("Received ControlCommand event: {:?}", status);
@@ -410,6 +461,16 @@ impl AirPodsDevice {
             battery_reporter,
         })
     }
+}
+
+/// The AirPods' name as saved in devices.json.
+fn saved_name(mac: &str) -> Option<String> {
+    let devices: std::collections::HashMap<String, crate::devices::enums::DeviceData> =
+        serde_json::from_str(&std::fs::read_to_string(get_devices_path()).ok()?).ok()?;
+    devices
+        .get(mac)
+        .map(|device| device.name.clone())
+        .filter(|name| !name.is_empty() && name != mac)
 }
 
 async fn local_adapter_address() -> bluer::Result<Address> {

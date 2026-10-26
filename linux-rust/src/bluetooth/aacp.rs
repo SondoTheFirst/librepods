@@ -378,7 +378,7 @@ pub enum AudioSourceType {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatteryComponent {
     Headphone = 1,
     Left = 4,

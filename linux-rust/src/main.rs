@@ -14,6 +14,7 @@ use crate::devices::enums::DeviceData;
 use crate::devices::registry::DeviceRegistry;
 use crate::prefs::{PrefsStore, load_app_settings, migrate_legacy_stem_control, save_app_settings};
 use crate::ui::messages::BluetoothUIMessage;
+use crate::ui::notifications::Notifier;
 use crate::ui::tray::MyTray;
 use crate::utils::{get_app_settings_path, get_devices_path};
 use bluer::{Address, InternalErrorKind};
@@ -153,6 +154,7 @@ async fn async_main(
             connected: false,
             listening_mode: None,
             allow_off_option: None,
+            model: None,
             command_tx: None,
             ui_tx: Some(ui_tx.clone()),
         };
@@ -176,6 +178,7 @@ async fn async_main(
         ui_tx: ui_tx.clone(),
         battery_reporter,
         prefs: PrefsStore::at_default_path(),
+        notifier: Notifier::connect().await,
     };
 
     info!("Listening for new connections.");
@@ -412,6 +415,10 @@ async fn disconnect_airpods(
                 tray.battery_c = None;
                 tray.battery_c_status = None;
                 tray.listening_mode = None;
+                tray.allow_off_option = None;
+                tray.conversation_detect_enabled = None;
+                tray.command_tx = None;
+                tray.model = None;
             })
             .await;
     }
