@@ -1,6 +1,6 @@
 [package]
 name = "librepods"
-version = "0.2.0-alpha.4"
+version = "0.2.0-alpha.5"
 edition = "2024"
 
 [dependencies]
@@ -33,3 +33,5 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3"
+# In-process peer-to-peer D-Bus servers for tests, so no test touches the real session bus.
+zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }

@@ -317,13 +317,11 @@ impl AirPodsDevice {
                             if !announced_connect {
                                 announced_connect = true;
                                 if settings.notify_on_connect {
-                                    notifier
-                                        .show(
-                                            &format!("connect:{}", mac),
-                                            &format!("{} connected", name),
-                                            &battery_summary(&battery_info),
-                                        )
-                                        .await;
+                                    notifier.show_detached(
+                                        &format!("connect:{}", mac),
+                                        &format!("{} connected", name),
+                                        &battery_summary(&battery_info),
+                                    );
                                 }
                             }
                             for component in low_battery.check(&battery_info) {
@@ -331,13 +329,11 @@ impl AirPodsDevice {
                                     && let Some(battery) =
                                         battery_info.iter().find(|b| b.component == component)
                                 {
-                                    notifier
-                                        .show(
-                                            &format!("battery:{}", mac),
-                                            &low_battery_text(&name, battery),
-                                            "Charge them soon.",
-                                        )
-                                        .await;
+                                    notifier.show_detached(
+                                        &format!("battery:{}", mac),
+                                        &low_battery_text(&name, battery),
+                                        "Charge them soon.",
+                                    );
                                 }
                             }
                         }
