@@ -8,6 +8,7 @@ use crate::bluetooth::proximity::{
     resolve_rpa,
 };
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
+use crate::devices::models::AirPodsModel;
 use crate::ui::tray::MyTray;
 use crate::utils::{get_devices_path, get_preferences_path};
 use bluer::monitor::{Monitor, MonitorEvent, Pattern};
@@ -187,8 +188,9 @@ impl AdvertHandler {
             let mac = self.known[index].mac.clone();
             if self.last_buds.get(&mac) != Some(&advert) {
                 info!(
-                    "BLE status for {}: left {}, right {}, case {}, in ear L:{} R:{}, lid {}, state {:?}",
+                    "BLE status for {} ({}): left {}, right {}, case {}, in ear L:{} R:{}, lid {}, state {:?}",
                     mac,
+                    AirPodsModel::from_ble_model_id(advert.model_id).display_name(),
                     describe(advert.left),
                     describe(advert.right),
                     describe(advert.case),
@@ -320,7 +322,7 @@ async fn run_monitor(adapter: &Adapter, handler: Arc<Mutex<AdvertHandler>>) -> b
             ..Default::default()
         })
         .await?;
-    debug!("Started LE monitor");
+    info!("BLE scanning in {:?} mode", ScanMode::Monitor);
 
     while let Some(event) = monitor_handle.next().await {
         let MonitorEvent::DeviceFound(device_id) = event else {
@@ -376,7 +378,7 @@ async fn run_discovery(
                 continue;
             }
         };
-        info!("LE discovery started (AirPods not connected)");
+        info!("BLE scanning in {:?} mode (AirPods not connected)", ScanMode::Discovery);
 
         loop {
             tokio::select! {
