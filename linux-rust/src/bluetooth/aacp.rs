@@ -1,6 +1,7 @@
 use crate::bluetooth::aacp_parse;
 use crate::devices::models::AirPodsModel;
 use crate::devices::enums::DeviceData;
+use crate::devices::settings::trim_value;
 use crate::utils::{apply_information, apply_le_key, get_devices_path, update_devices_file};
 use bluer::{
     Address, AddressType, Error, Result,
@@ -179,7 +180,7 @@ impl ControlCommandIdentifiers {
         Self::ExtendedHoldAndRelease,
     ];
 
-    fn from_u8(value: u8) -> Option<Self> {
+    pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0x01 => Some(Self::MicMode),
             0x02 => Some(Self::Scan),
@@ -721,12 +722,7 @@ impl AACPManager {
                 }
                 let identifier_byte = payload[2];
                 let value_bytes = &payload[3..7];
-
-                let last_non_zero = value_bytes.iter().rposition(|&b| b != 0);
-                let value = match last_non_zero {
-                    Some(i) => value_bytes[..=i].to_vec(),
-                    None => vec![0],
-                };
+                let value = trim_value(value_bytes);
 
                 if let Some(identifier) = ControlCommandIdentifiers::from_u8(identifier_byte) {
                     let status = ControlCommandStatus {
