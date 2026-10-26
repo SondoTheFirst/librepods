@@ -668,8 +668,16 @@ impl AACPManager {
         self.send_packet(&packet).await
     }
 
+    /// Installs the event channel. The AirPods often send their Information packets before
+    /// it exists, so a model learned by then is passed on at once.
     pub async fn set_event_channel(&self, tx: mpsc::UnboundedSender<AACPEvent>) {
         let mut state = self.state.lock().await;
+        if let Some(model) = state.model {
+            let _ = tx.send(AACPEvent::DeviceInfo {
+                model,
+                firmware_major: state.firmware_major,
+            });
+        }
         state.event_tx = Some(tx);
     }
 
@@ -1462,6 +1470,46 @@ mod tests {
         assert!(state.model.is_none());
         assert!(state.bud_role.is_none());
         assert!(state.capabilities.is_empty());
+    }
+
+    /// An Information packet as the AirPods send it (header included).
+    fn information_packet(model_number: &str, version3: &str) -> Vec<u8> {
+        let mut packet = vec![0x04, 0x00, 0x04, 0x00, 0x1D, 0x00, 0xAA, 0xBB];
+        packet.extend_from_slice(
+            format!(
+                "X\0Y\0Logan's AirPods Pro\0{model_number}\0Apple Inc.\0SER\0v1\0v2\01.0.0\0upd\0LS\0RS\0{version3}\0"
+            )
+            .as_bytes(),
+        );
+        packet
+    }
+
+    #[tokio::test]
+    async fn event_channel_learns_a_model_reported_before_it_existed() {
+        // The A2084 sends its Information packets right after the handshake, before the
+        // device's event loop is listening; the model must still reach the tray.
+        let aacp = AACPManager::new();
+        aacp.receive_packet(&information_packet("A2084", "6619472")).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        aacp.set_event_channel(tx).await;
+        match rx.try_recv() {
+            Ok(AACPEvent::DeviceInfo {
+                model,
+                firmware_major,
+            }) => {
+                assert_eq!(model, AirPodsModel::AirPodsPro1);
+                assert_eq!(firmware_major, Some(6));
+            }
+            other => panic!("expected the known model, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_channel_replays_nothing_before_information() {
+        let aacp = AACPManager::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        aacp.set_event_channel(tx).await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
