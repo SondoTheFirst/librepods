@@ -2,20 +2,24 @@
 //! `devices::settings`, plus the name and the device information.
 
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
+use crate::bluetooth::aacp_parse::{Accommodation, CustomEq};
 use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation};
+use crate::devices::models::Capability;
 use crate::devices::settings::{
-    ChoiceOption, ControlKind, ControlSpec, Section, decode_toggle, encode_per_bud,
-    encode_slider, encode_toggle, per_bud_values, rename_request, selected_choice, slider_value,
-    visible_controls,
+    ChoiceOption, ControlKind, ControlSpec, ListeningMode, Section, decode_toggle,
+    default_cycle, encode_per_bud, encode_slider, encode_toggle, listening_modes, per_bud_values,
+    rename_request, selected_choice, shows_custom_eq, shows_stem_actions, slider_value,
+    toggle_cycle_mode, visible_controls,
 };
+use crate::prefs::{Bud, DevicePrefs, PressType, StemAction};
 use crate::ui::window::Message;
 use iced::Alignment::End;
 use iced::border::Radius;
 use iced::widget::button::Style;
 use iced::widget::rule::FillMode;
 use iced::widget::{
-    Space, button, column, container, pick_list, row, rule, scrollable, slider, text, text_input,
-    toggler,
+    Space, button, checkbox, column, container, pick_list, row, rule, scrollable, slider, text,
+    text_input, toggler,
 };
 use iced::{Background, Border, Center, Color, Element, Length, Padding, Theme};
 use log::error;
@@ -86,21 +90,35 @@ pub fn airpods_view<'a>(
 ) -> iced::widget::Container<'a, Message> {
     let controls = visible_controls(state.model_or_unknown(), state.firmware_major);
     let mut page = column![name_row(mac, state)].spacing(20);
+    if let Some(listening) = listening_mode_section(mac, state) {
+        page = page.push(listening);
+    }
 
     for section in SECTIONS {
-        let rows: Vec<Element<'a, Message>> = controls
-            .iter()
-            .filter(|spec| spec.section == section)
-            .map(|spec| control_row(mac, spec, state))
-            .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        page = page.push(if section == Section::Advanced {
-            advanced_section(mac, state, rows)
+        let mut rows: Vec<Element<'a, Message>> = if section == Section::PressAndHold {
+            cycle_rows(mac, state)
         } else {
-            section_card(section_title(section), rows)
-        });
+            Vec::new()
+        };
+        rows.extend(
+            controls
+                .iter()
+                .filter(|spec| spec.section == section)
+                .map(|spec| control_row(mac, spec, state)),
+        );
+        rows.extend(trailing_rows(mac, state, section));
+        if !rows.is_empty() {
+            page = page.push(if section == Section::Advanced {
+                advanced_section(mac, state, rows)
+            } else {
+                section_card(section_title(section), rows)
+            });
+        }
+        if section == Section::PressAndHold
+            && let Some(stem) = stem_actions_section(mac, state)
+        {
+            page = page.push(stem);
+        }
     }
 
     if let Some(information) = information_section(mac, devices_list) {
@@ -251,6 +269,519 @@ fn control_row<'a>(
             )
         }
     }
+}
+
+/// The custom EQ before the AirPods report one: off and flat.
+pub const DEFAULT_CUSTOM_EQ: CustomEq = CustomEq {
+    enabled: false,
+    low: 50,
+    mid: 50,
+    high: 50,
+};
+
+/// Headphone accommodation before the AirPods report it: off, every band in the middle.
+pub const DEFAULT_ACCOMMODATION: Accommodation = Accommodation {
+    phone: false,
+    media: false,
+    bands: [50.0; 8],
+};
+
+fn listening_modes_for(state: &AirPodsState) -> Vec<ListeningMode> {
+    let allow_off = state
+        .controls
+        .get(&ControlCommandIdentifiers::AllowOffOption)
+        .and_then(|value| decode_toggle(value));
+    listening_modes(state.model_or_unknown(), allow_off)
+}
+
+fn current_listening_mode(state: &AirPodsState) -> Option<ListeningMode> {
+    state
+        .controls
+        .get(&ControlCommandIdentifiers::ListeningMode)
+        .and_then(|value| value.first().copied())
+        .and_then(ListeningMode::from_byte)
+}
+
+fn muted_text<'a>(content: &'a str) -> iced::widget::Text<'a> {
+    text(content).size(12).style(|theme: &Theme| {
+        let mut style = text::Style::default();
+        style.color = Some(theme.palette().text.scale_alpha(0.7));
+        style
+    })
+}
+
+fn listening_mode_section<'a>(mac: &'a str, state: &'a AirPodsState) -> Option<Element<'a, Message>> {
+    let modes = listening_modes_for(state);
+    if modes.is_empty() {
+        return None;
+    }
+    let current = current_listening_mode(state);
+    let mut buttons = row![].spacing(8);
+    for mode in modes {
+        let selected = current == Some(mode);
+        buttons = buttons.push(
+            button(text(mode.label()).size(14).width(Length::Fill).align_x(Center))
+                .width(Length::Fill)
+                .padding(8)
+                .on_press(Message::SetControl(
+                    mac.to_string(),
+                    ControlCommandIdentifiers::ListeningMode,
+                    vec![mode.byte()],
+                ))
+                .style(move |theme: &Theme, _status| {
+                    let mut style = Style::default();
+                    style.text_color = theme.palette().text;
+                    style.background = Some(Background::Color(if selected {
+                        theme.palette().primary.scale_alpha(0.6)
+                    } else {
+                        theme.palette().primary.scale_alpha(0.15)
+                    }));
+                    style.border = Border::default().rounded(12.0);
+                    style
+                }),
+        );
+    }
+    let mut rows: Vec<Element<'a, Message>> = vec![buttons.into()];
+    if state.model_or_unknown().has(Capability::AdaptiveAudio)
+        && current == Some(ListeningMode::Adaptive)
+    {
+        let id = ControlCommandIdentifiers::AutoAncStrength;
+        let value = state
+            .controls
+            .get(&id)
+            .and_then(|value| slider_value(value))
+            .map_or(50, |v| v.min(100));
+        let draft_mac = mac.to_string();
+        let control = slider(0..=100u8, value, move |v| {
+            Message::ControlDraft(draft_mac.clone(), id, vec![v])
+        })
+        .on_release(Message::SendControl(mac.to_string(), id));
+        rows.push(
+            column![
+                text("Adaptive noise filtering").size(16),
+                row![muted_text("Let in more sound"), control, muted_text("Reduce more noise")]
+                    .spacing(8)
+                    .align_y(Center),
+            ]
+            .spacing(4)
+            .into(),
+        );
+    }
+    Some(section_card("Listening Mode", rows))
+}
+
+fn mode_description(mode: ListeningMode) -> &'static str {
+    match mode {
+        ListeningMode::Off => "Turns off noise management",
+        ListeningMode::NoiseCancellation => "Blocks out external sounds",
+        ListeningMode::Transparency => "Lets in external sounds",
+        ListeningMode::Adaptive => "Dynamically adjust external noise",
+    }
+}
+
+/// Which listening modes a press and hold cycles through. A mode that can't be removed
+/// (only two left) can't be unticked.
+fn cycle_rows<'a>(mac: &'a str, state: &'a AirPodsState) -> Vec<Element<'a, Message>> {
+    let modes = listening_modes_for(state);
+    if modes.is_empty() {
+        return Vec::new();
+    }
+    let id = ControlCommandIdentifiers::ListeningModeConfigs;
+    let mask = state
+        .controls
+        .get(&id)
+        .and_then(|value| value.first().copied())
+        .filter(|mask| mask & 0x0F != 0)
+        .or(state.prefs.listening_mode_cycle)
+        .unwrap_or_else(|| default_cycle(state.model_or_unknown()));
+    let mut list = column![text("Press and hold cycles through").size(16)].spacing(6);
+    for mode in modes {
+        let next = toggle_cycle_mode(mask, mode);
+        let on_toggle = (next != mask).then(|| {
+            let mac = mac.to_string();
+            move |_checked: bool| Message::SetControl(mac.clone(), id, vec![next])
+        });
+        list = list.push(
+            row![
+                checkbox(mask & mode.cycle_bit() != 0).on_toggle_maybe(on_toggle),
+                column![text(mode.label()).size(14), muted_text(mode_description(mode))]
+            ]
+            .spacing(8)
+            .align_y(Center),
+        );
+    }
+    vec![list.into()]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StemChoice {
+    Native,
+    PlayPause,
+    NextTrack,
+    PreviousTrack,
+    CycleListeningMode,
+    Command,
+}
+
+const STEM_CHOICES: [StemChoice; 6] = [
+    StemChoice::Native,
+    StemChoice::PlayPause,
+    StemChoice::NextTrack,
+    StemChoice::PreviousTrack,
+    StemChoice::CycleListeningMode,
+    StemChoice::Command,
+];
+
+impl std::fmt::Display for StemChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            StemChoice::Native => "AirPods default",
+            StemChoice::PlayPause => "Play/Pause",
+            StemChoice::NextTrack => "Next track",
+            StemChoice::PreviousTrack => "Previous track",
+            StemChoice::CycleListeningMode => "Cycle listening mode",
+            StemChoice::Command => "Run command…",
+        })
+    }
+}
+
+fn stem_choice(action: &StemAction) -> StemChoice {
+    match action {
+        StemAction::Native => StemChoice::Native,
+        StemAction::PlayPause => StemChoice::PlayPause,
+        StemAction::NextTrack => StemChoice::NextTrack,
+        StemAction::PreviousTrack => StemChoice::PreviousTrack,
+        StemAction::CycleListeningMode => StemChoice::CycleListeningMode,
+        StemAction::Command(_) => StemChoice::Command,
+    }
+}
+
+/// The action for a picked choice; picking "Run command…" again keeps the command typed so far.
+fn stem_action_for(choice: StemChoice, current: &StemAction) -> StemAction {
+    match choice {
+        StemChoice::Native => StemAction::Native,
+        StemChoice::PlayPause => StemAction::PlayPause,
+        StemChoice::NextTrack => StemAction::NextTrack,
+        StemChoice::PreviousTrack => StemAction::PreviousTrack,
+        StemChoice::CycleListeningMode => StemAction::CycleListeningMode,
+        StemChoice::Command => match current {
+            StemAction::Command(command) => StemAction::Command(command.clone()),
+            _ => StemAction::Command(String::new()),
+        },
+    }
+}
+
+const PRESS_LABELS: [(PressType, &str); 4] = [
+    (PressType::Single, "Press once"),
+    (PressType::Double, "Press twice"),
+    (PressType::Triple, "Press three times"),
+    (PressType::Long, "Press and hold"),
+];
+
+fn bud_label(bud: Bud) -> &'static str {
+    match bud {
+        Bud::Left => "Left",
+        Bud::Right => "Right",
+    }
+}
+
+fn stem_actions_section<'a>(mac: &'a str, state: &'a AirPodsState) -> Option<Element<'a, Message>> {
+    if !shows_stem_actions(state.model_or_unknown(), &state.prefs.stem_actions) {
+        return None;
+    }
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    for (press, label) in PRESS_LABELS {
+        let picker = |bud: Bud| {
+            let prefs = state.prefs.clone();
+            let mac = mac.to_string();
+            pick_list(
+                STEM_CHOICES,
+                Some(stem_choice(state.prefs.stem_actions.get(bud, press))),
+                move |choice: StemChoice| {
+                    let mut prefs = prefs.clone();
+                    let action = stem_action_for(choice, prefs.stem_actions.get(bud, press));
+                    prefs.stem_actions.set(bud, press, action);
+                    Message::SetPrefs(mac.clone(), prefs)
+                },
+            )
+            .width(Length::Fixed(200.0))
+        };
+        let mut entry = column![labeled_row(
+            label,
+            "",
+            column![
+                row![text("Left").size(14).width(Length::Fixed(44.0)), picker(Bud::Left)].align_y(Center),
+                row![text("Right").size(14).width(Length::Fixed(44.0)), picker(Bud::Right)].align_y(Center),
+            ]
+            .spacing(6),
+        )]
+        .spacing(6);
+        for bud in [Bud::Left, Bud::Right] {
+            if let StemAction::Command(command) = state.prefs.stem_actions.get(bud, press) {
+                let prefs = state.prefs.clone();
+                let draft_mac = mac.to_string();
+                let input = text_input("Command to run, then press Enter", command)
+                    .on_input(move |typed| {
+                        let mut prefs = prefs.clone();
+                        prefs.stem_actions.set(bud, press, StemAction::Command(typed));
+                        Message::PrefsDraft(draft_mac.clone(), prefs)
+                    })
+                    .on_submit(Message::SavePrefs(mac.to_string()))
+                    .padding(6);
+                entry = entry.push(
+                    row![muted_text(bud_label(bud)).width(Length::Fixed(44.0)), input]
+                        .spacing(8)
+                        .align_y(Center),
+                );
+            }
+        }
+        rows.push(entry.into());
+    }
+    Some(
+        column![
+            heading("Stem Actions"),
+            container(muted_text(
+                "Presses set here are handled by this computer instead of the AirPods."
+            ))
+            .padding(Padding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 18.0,
+                right: 18.0,
+            }),
+            rows_card(rows)
+        ]
+        .spacing(4)
+        .into(),
+    )
+}
+
+fn trailing_rows<'a>(mac: &'a str, state: &'a AirPodsState, section: Section) -> Vec<Element<'a, Message>> {
+    match section {
+        Section::Audio => {
+            let mut rows = equalizer_rows(mac, state);
+            rows.extend(speaking_rows(mac, state));
+            rows
+        }
+        Section::Connection => connection_pref_rows(mac, state),
+        Section::Accessibility => accommodation_rows(mac, state),
+        _ => Vec::new(),
+    }
+}
+
+fn equalizer_rows<'a>(mac: &'a str, state: &'a AirPodsState) -> Vec<Element<'a, Message>> {
+    if !shows_custom_eq(state.firmware_major) {
+        return Vec::new();
+    }
+    let eq = state.custom_eq.unwrap_or(DEFAULT_CUSTOM_EQ);
+    let toggle_mac = mac.to_string();
+    let mut rows = vec![toggle_row(
+        "Equalizer",
+        "A three-band equalizer applied by the AirPods. 50 is flat.",
+        eq.enabled,
+        move |on| Message::CustomEqDraft(toggle_mac.clone(), CustomEq { enabled: on, ..eq }),
+    )];
+    let bands: [(&'static str, u8, fn(&mut CustomEq, u8)); 3] = [
+        ("Low", eq.low, |eq, v| eq.low = v),
+        ("Mid", eq.mid, |eq, v| eq.mid = v),
+        ("High", eq.high, |eq, v| eq.high = v),
+    ];
+    for (label, value, set) in bands {
+        let draft_mac = mac.to_string();
+        let control = slider(0..=100u8, value, move |v| {
+            let mut changed = eq;
+            set(&mut changed, v);
+            Message::CustomEqDraft(draft_mac.clone(), changed)
+        })
+        .on_release(Message::SendCustomEq(mac.to_string()))
+        .width(Length::Fixed(200.0));
+        rows.push(labeled_row(
+            label,
+            "",
+            row![control, text(value.to_string()).size(14).width(Length::Fixed(32.0))]
+                .spacing(8)
+                .align_y(Center),
+        ));
+    }
+    rows
+}
+
+/// A toggle for one of this app's own preferences (saved at once, nothing sent).
+fn prefs_toggle<'a>(
+    mac: &'a str,
+    prefs: &DevicePrefs,
+    label: &'a str,
+    description: &'a str,
+    value: bool,
+    set: fn(&mut DevicePrefs, bool),
+) -> Element<'a, Message> {
+    let prefs = prefs.clone();
+    let mac = mac.to_string();
+    toggle_row(label, description, value, move |on| {
+        let mut prefs = prefs.clone();
+        set(&mut prefs, on);
+        Message::SetPrefs(mac.clone(), prefs)
+    })
+}
+
+/// A 0–100 % slider for one of this app's own preferences, saved on release.
+fn prefs_percent<'a>(
+    mac: &'a str,
+    prefs: &DevicePrefs,
+    label: &'a str,
+    value: u8,
+    set: fn(&mut DevicePrefs, u8),
+) -> Element<'a, Message> {
+    let value = value.min(100);
+    let draft = prefs.clone();
+    let draft_mac = mac.to_string();
+    let control = slider(0..=100u8, value, move |v| {
+        let mut prefs = draft.clone();
+        set(&mut prefs, v);
+        Message::PrefsDraft(draft_mac.clone(), prefs)
+    })
+    .on_release(Message::SavePrefs(mac.to_string()))
+    .width(Length::Fixed(200.0));
+    labeled_row(
+        label,
+        "",
+        row![control, text(format!("{}%", value)).size(14).width(Length::Fixed(40.0))]
+            .spacing(8)
+            .align_y(Center),
+    )
+}
+
+fn speaking_rows<'a>(mac: &'a str, state: &'a AirPodsState) -> Vec<Element<'a, Message>> {
+    if !state.model_or_unknown().has(Capability::ConversationAwareness) {
+        return Vec::new();
+    }
+    let prefs = &state.prefs;
+    vec![
+        column![
+            text("When you speak").size(16),
+            muted_text("What this computer does when Conversation Awareness hears you talking.")
+        ]
+        .into(),
+        prefs_percent(mac, prefs, "Lower media to", prefs.conversation_volume, |p, v| {
+            p.conversation_volume = v
+        }),
+        prefs_percent(
+            mac,
+            prefs,
+            "Lower further to",
+            prefs.conversation_reduced_volume,
+            |p, v| p.conversation_reduced_volume = v,
+        ),
+        prefs_toggle(
+            mac,
+            prefs,
+            "Relative to current volume",
+            "Lower to a share of your volume instead of a fixed level.",
+            prefs.conversation_relative,
+            |p, on| p.conversation_relative = on,
+        ),
+        prefs_toggle(
+            mac,
+            prefs,
+            "Pause media instead",
+            "Pause playback while you speak instead of lowering it.",
+            prefs.conversation_pause_music,
+            |p, on| p.conversation_pause_music = on,
+        ),
+    ]
+}
+
+fn connection_pref_rows<'a>(mac: &'a str, state: &'a AirPodsState) -> Vec<Element<'a, Message>> {
+    let prefs = &state.prefs;
+    vec![
+        prefs_toggle(
+            mac,
+            prefs,
+            "Disconnect audio when not wearing",
+            "Turns the AirPods' audio off when both are out of your ears, and back on when you put one in.",
+            prefs.disconnect_when_not_wearing,
+            |p, on| p.disconnect_when_not_wearing = on,
+        ),
+        prefs_toggle(
+            mac,
+            prefs,
+            "Connect when nearby (BLE)",
+            "Connect these AirPods to this computer when they are out of the case and not connected to anything.",
+            prefs.auto_connect,
+            |p, on| p.auto_connect = on,
+        ),
+        prefs_toggle(
+            mac,
+            prefs,
+            "Take over when media starts playing here",
+            "Switch the AirPods to this computer when you start playing something with an AirPod in your ear.",
+            prefs.takeover_on_media_start,
+            |p, on| p.takeover_on_media_start = on,
+        ),
+        prefs_toggle(
+            mac,
+            prefs,
+            "…even if they are playing music for another device",
+            "",
+            prefs.takeover_from_music,
+            |p, on| p.takeover_from_music = on,
+        ),
+        prefs_toggle(
+            mac,
+            prefs,
+            "…even during a call on another device",
+            "",
+            prefs.takeover_from_call,
+            |p, on| p.takeover_from_call = on,
+        ),
+    ]
+}
+
+fn accommodation_rows<'a>(mac: &'a str, state: &'a AirPodsState) -> Vec<Element<'a, Message>> {
+    let current = state.accommodation.unwrap_or(DEFAULT_ACCOMMODATION);
+    let phone_mac = mac.to_string();
+    let media_mac = mac.to_string();
+    let mut rows = vec![
+        column![
+            text("Headphone Accommodation (experimental)").size(16),
+            muted_text(
+                "Boosts soft sounds for phone calls and media. Nothing is sent until you change something here."
+            )
+        ]
+        .into(),
+        toggle_row("Phone calls", "", current.phone, move |on| {
+            Message::AccommodationDraft(phone_mac.clone(), Accommodation { phone: on, ..current })
+        }),
+        toggle_row("Media", "", current.media, move |on| {
+            Message::AccommodationDraft(media_mac.clone(), Accommodation { media: on, ..current })
+        }),
+    ];
+    if current.phone || current.media {
+        for (index, band) in current.bands.iter().copied().enumerate() {
+            let draft_mac = mac.to_string();
+            let control = slider(0.0..=100.0f32, band.clamp(0.0, 100.0), move |v| {
+                let mut changed = current;
+                if let Some(slot) = changed.bands.get_mut(index) {
+                    *slot = v;
+                }
+                Message::AccommodationDraft(draft_mac.clone(), changed)
+            })
+            .step(1.0f32)
+            .on_release(Message::SendAccommodation(mac.to_string()))
+            .width(Length::Fixed(200.0));
+            rows.push(
+                row![
+                    text(format!("Band {}", index + 1)).size(14).width(Length::Fill),
+                    control,
+                    text(format!("{:.0}", band)).size(14).width(Length::Fixed(32.0))
+                ]
+                .spacing(8)
+                .align_y(Center)
+                .into(),
+            );
+        }
+    }
+    rows
 }
 
 fn label_column<'a>(label: &'a str, description: &'a str) -> iced::widget::Column<'a, Message> {
@@ -509,5 +1040,27 @@ mod tests {
                 let _ = airpods_view(MAC, &HashMap::new(), &state);
             }
         }
+    }
+
+    #[test]
+    fn view_builds_with_every_section_in_use() {
+        use crate::bluetooth::aacp_parse::{Accommodation, CustomEq};
+        use crate::prefs::StemAction;
+        let mut configured = sample_state();
+        configured.model = Some(AirPodsModel::AirPodsPro1);
+        configured.firmware_major = Some(9);
+        configured.prefs.stem_actions.left_long = StemAction::Command("x".to_string());
+        configured.prefs.stem_actions.right_double = StemAction::NextTrack;
+        configured.custom_eq = Some(CustomEq { enabled: true, low: 20, mid: 50, high: 80 });
+        configured.accommodation = Some(Accommodation { phone: true, media: false, bands: [50.0; 8] });
+        configured.controls.insert(Id::ListeningModeConfigs, vec![0x07]);
+        let _ = airpods_view(MAC, &HashMap::new(), &configured);
+
+        let mut adaptive = sample_state();
+        adaptive.model = Some(AirPodsModel::AirPodsPro2UsbC);
+        adaptive.firmware_major = Some(8);
+        adaptive.controls.insert(Id::ListeningMode, vec![0x04]);
+        adaptive.controls.insert(Id::AutoAncStrength, vec![30]);
+        let _ = airpods_view(MAC, &HashMap::new(), &adaptive);
     }
 }

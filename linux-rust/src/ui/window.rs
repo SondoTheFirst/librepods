@@ -5,11 +5,14 @@ use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::{
     AirPodsState, DeviceData, DeviceState, DeviceType, NothingAncMode, NothingState,
 };
+use crate::bluetooth::aacp_parse::{Accommodation, CustomEq};
+use crate::devices::commands::stem_forwarding_mask;
 use crate::devices::settings::{decode_toggle, rename_request, trim_value};
+use crate::ui::airpods::{DEFAULT_ACCOMMODATION, DEFAULT_CUSTOM_EQ};
 use crate::ui::airpods::airpods_view;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
-use crate::prefs::{PrefsStore, load_app_settings, save_app_settings};
+use crate::prefs::{DevicePrefs, PrefsStore, load_app_settings, save_app_settings};
 use crate::utils::{MyTheme, get_app_settings_path, get_devices_path, update_devices_file};
 use bluer::{Address};
 use iced::border::Radius;
@@ -76,7 +79,8 @@ pub struct App {
     device_type_state: combo_box::State<DeviceType>,
     selected_device_type: Option<DeviceType>,
     tray_text_mode: bool,
-    stem_control: bool,
+    notify_on_connect: bool,
+    notify_low_battery: bool,
     prefs: PrefsStore,
 }
 
@@ -120,7 +124,20 @@ pub enum Message {
     /// Whether sending something (named) to the AirPods worked.
     CommandSent(String, bool),
     TrayTextModeChanged(bool), // yes, I know I should add all settings to a struct, but I'm lazy
-    StemControlChanged(bool),
+    NotifyOnConnectChanged(bool),
+    NotifyLowBatteryChanged(bool),
+    /// The custom EQ changed on the page; an on/off change is sent at once, bands on release.
+    CustomEqDraft(String, CustomEq),
+    SendCustomEq(String),
+    /// Headphone accommodation changed; phone/media changes are sent at once, bands on release.
+    AccommodationDraft(String, Accommodation),
+    SendAccommodation(String),
+    /// Save these preferences now (toggles, pickers).
+    SetPrefs(String, DevicePrefs),
+    /// Preferences being edited (sliders, command text): shown only.
+    PrefsDraft(String, DevicePrefs),
+    /// Save the preferences being edited.
+    SavePrefs(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -163,7 +180,8 @@ impl App {
         let app_settings = load_app_settings(&get_app_settings_path());
         let selected_theme = app_settings.theme;
         let tray_text_mode = app_settings.tray_text_mode;
-        let stem_control = app_settings.stem_control;
+        let notify_on_connect = app_settings.notify_on_connect;
+        let notify_low_battery = app_settings.notify_low_battery;
 
         let bluetooth_state = BluetoothState::new();
 
@@ -214,7 +232,8 @@ impl App {
                 selected_device_type: None,
                 device_managers,
                 tray_text_mode,
-                stem_control,
+                notify_on_connect,
+                notify_low_battery,
                 prefs,
             },
             Task::batch(vec![open_task, wait_task]),
@@ -250,13 +269,57 @@ impl App {
         )
     }
 
+    fn send_custom_eq(&self, mac: &str, eq: CustomEq) -> Task<Message> {
+        let Some(aacp_manager) = self.aacp_for(mac) else {
+            warn!("AirPods {} are not connected; not sending the equalizer", mac);
+            return Task::none();
+        };
+        Task::perform(
+            async move { aacp_manager.send_custom_eq(eq).await.is_ok() },
+            |ok| Message::CommandSent("Custom EQ".to_string(), ok),
+        )
+    }
+
+    fn send_accommodation(&self, mac: &str, accommodation: Accommodation) -> Task<Message> {
+        let Some(aacp_manager) = self.aacp_for(mac) else {
+            warn!("AirPods {} are not connected; not sending headphone accommodation", mac);
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                aacp_manager
+                    .send_headphone_accommodation(&accommodation)
+                    .await
+                    .is_ok()
+            },
+            |ok| Message::CommandSent("Headphone Accommodation".to_string(), ok),
+        )
+    }
+
+    /// Stores this device's preferences; when its stem actions now need different presses
+    /// forwarded, tells the AirPods.
+    fn save_prefs(&self, mac: &str, prefs: DevicePrefs) -> Task<Message> {
+        let before = self.prefs.device(mac);
+        if let Err(e) = self.prefs.update(mac, |stored| *stored = prefs.clone()) {
+            error!("Failed to save preferences for {}: {}", mac, e);
+            return Task::none();
+        }
+        match stem_config_update(&before, &prefs) {
+            Some(mask) => {
+                self.send_control(mac, ControlCommandIdentifiers::StemConfig, mask)
+            }
+            None => Task::none(),
+        }
+    }
+
     /// Saves this window's settings on top of the file, so settings it doesn't show survive.
     fn persist_app_settings(&self) {
         let path = get_app_settings_path();
         let mut settings = load_app_settings(&path);
         settings.theme = self.selected_theme;
         settings.tray_text_mode = self.tray_text_mode;
-        settings.stem_control = self.stem_control;
+        settings.notify_on_connect = self.notify_on_connect;
+        settings.notify_low_battery = self.notify_low_battery;
         debug!("Writing settings to {}: {:?}", path.display(), settings);
         if let Err(e) = save_app_settings(&path, &settings) {
             error!("Failed to save app settings: {}", e);
@@ -593,11 +656,75 @@ impl App {
                 self.persist_app_settings();
                 Task::none()
             }
-            Message::StemControlChanged(is_enabled) => {
-                self.stem_control = is_enabled;
+            Message::NotifyOnConnectChanged(is_enabled) => {
+                self.notify_on_connect = is_enabled;
                 self.persist_app_settings();
                 Task::none()
             }
+            Message::NotifyLowBatteryChanged(is_enabled) => {
+                self.notify_low_battery = is_enabled;
+                self.persist_app_settings();
+                Task::none()
+            }
+            Message::CustomEqDraft(mac, eq) => {
+                let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac) else {
+                    return Task::none();
+                };
+                let switched = state.custom_eq.unwrap_or(DEFAULT_CUSTOM_EQ).enabled != eq.enabled;
+                state.custom_eq = Some(eq);
+                if switched {
+                    self.send_custom_eq(&mac, eq)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::SendCustomEq(mac) => match self.device_states.get(&mac) {
+                Some(DeviceState::AirPods(state)) => {
+                    let eq = state.custom_eq.unwrap_or(DEFAULT_CUSTOM_EQ);
+                    self.send_custom_eq(&mac, eq)
+                }
+                _ => Task::none(),
+            },
+            Message::AccommodationDraft(mac, accommodation) => {
+                let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac) else {
+                    return Task::none();
+                };
+                let before = state.accommodation.unwrap_or(DEFAULT_ACCOMMODATION);
+                let switched =
+                    before.phone != accommodation.phone || before.media != accommodation.media;
+                state.accommodation = Some(accommodation);
+                if switched {
+                    self.send_accommodation(&mac, accommodation)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::SendAccommodation(mac) => match self.device_states.get(&mac) {
+                Some(DeviceState::AirPods(state)) => {
+                    let accommodation = state.accommodation.unwrap_or(DEFAULT_ACCOMMODATION);
+                    self.send_accommodation(&mac, accommodation)
+                }
+                _ => Task::none(),
+            },
+            Message::SetPrefs(mac, prefs) => {
+                if let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac) {
+                    state.prefs = prefs.clone();
+                }
+                self.save_prefs(&mac, prefs)
+            }
+            Message::PrefsDraft(mac, prefs) => {
+                if let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac) {
+                    state.prefs = prefs;
+                }
+                Task::none()
+            }
+            Message::SavePrefs(mac) => match self.device_states.get(&mac) {
+                Some(DeviceState::AirPods(state)) => {
+                    let prefs = state.prefs.clone();
+                    self.save_prefs(&mac, prefs)
+                }
+                _ => Task::none(),
+            },
         }
     }
 
@@ -981,50 +1108,9 @@ impl App {
                                 ]
                                 .spacing(12);
 
-                            let stem_control_value = self.stem_control;
-                            let stem_control_toggle = container(
-                                row![
-                                    column![
-                                        text("Stem press track control").size(16),
-                                        text("Double press = next track, triple press = previous track. Disable if your environment handles AirPods AVRCP commands natively.").size(12).style(
-                                            |theme: &Theme| {
-                                                let mut style = text::Style::default();
-                                                style.color = Some(theme.palette().text.scale_alpha(0.7));
-                                                style
-                                            }
-                                        ).width(Length::Fill)
-                                    ].width(Length::Fill),
-                                    toggler(stem_control_value)
-                                        .on_toggle(move |is_enabled| {
-                                            Message::StemControlChanged(is_enabled)
-                                        })
-                                    .spacing(0)
-                                    .size(20)
-                                    ]
-                                        .align_y(Center)
-                                        .spacing(12)
-                                    )
-                                        .padding(Padding{
-                                            top: 5.0,
-                                            bottom: 5.0,
-                                            left: 18.0,
-                                            right: 18.0,
-                                        })
-                                        .style(
-                                            |theme: &Theme| {
-                                                let mut style = container::Style::default();
-                                                style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-                                                let mut border = Border::default();
-                                                border.color = theme.palette().primary.scale_alpha(0.5);
-                                                style.border = border.rounded(16);
-                                                style
-                                            }
-                                        )
-                                    .align_y(Center);
-
-                            let controls_settings_col = column![
+                            let notifications_settings_col = column![
                                 container(
-                                    text("Controls").size(20).style(
+                                    text("Notifications").size(20).style(
                                         |theme: &Theme| {
                                             let mut style = text::Style::default();
                                             style.color = Some(theme.palette().primary);
@@ -1038,7 +1124,18 @@ impl App {
                                     left: 18.0,
                                     right: 18.0,
                                 }),
-                                stem_control_toggle
+                                settings_toggle(
+                                    "Notify when AirPods connect",
+                                    "Shows the battery levels when your AirPods connect.",
+                                    self.notify_on_connect,
+                                    Message::NotifyOnConnectChanged,
+                                ),
+                                settings_toggle(
+                                    "Low battery notifications",
+                                    "Warns once when an AirPod drops to 20% or below.",
+                                    self.notify_low_battery,
+                                    Message::NotifyLowBatteryChanged,
+                                ),
                             ]
                             .spacing(12);
 
@@ -1048,7 +1145,7 @@ impl App {
                                     Space::new().height(Length::from(20)),
                                     tray_text_mode_toggle,
                                     Space::new().height(Length::from(20)),
-                                    controls_settings_col,
+                                    notifications_settings_col,
                                 ]
                             )
                                 .padding(20)
@@ -1231,6 +1328,55 @@ impl App {
     }
 }
 
+/// The 0x39 value to send when a preferences change alters which presses must be forwarded.
+fn stem_config_update(old: &DevicePrefs, new: &DevicePrefs) -> Option<Vec<u8>> {
+    let before = stem_forwarding_mask(&old.stem_actions);
+    let after = stem_forwarding_mask(&new.stem_actions);
+    (before != after).then(|| vec![after])
+}
+
+fn settings_toggle<'a>(
+    label: &'a str,
+    description: &'a str,
+    value: bool,
+    on_toggle: fn(bool) -> Message,
+) -> Element<'a, Message> {
+    container(
+        row![
+            column![
+                text(label).size(16),
+                text(description)
+                    .size(12)
+                    .style(|theme: &Theme| {
+                        let mut style = text::Style::default();
+                        style.color = Some(theme.palette().text.scale_alpha(0.7));
+                        style
+                    })
+                    .width(Length::Fill)
+            ]
+            .width(Length::Fill),
+            toggler(value).on_toggle(on_toggle).spacing(0).size(20)
+        ]
+        .align_y(Center)
+        .spacing(12),
+    )
+    .padding(Padding {
+        top: 5.0,
+        bottom: 5.0,
+        left: 18.0,
+        right: 18.0,
+    })
+    .style(|theme: &Theme| {
+        let mut style = container::Style::default();
+        style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
+        let mut border = Border::default();
+        border.color = theme.palette().primary.scale_alpha(0.5);
+        style.border = border.rounded(16);
+        style
+    })
+    .into()
+}
+
 async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>>>) -> Message {
     let mut rx = ui_rx.lock().await;
     match rx.recv().await {
@@ -1264,3 +1410,22 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
 //
 //     devices
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prefs::{DevicePrefs, StemAction};
+
+    #[test]
+    fn changing_stem_actions_recomputes_forwarding() {
+        let default = DevicePrefs::default();
+        let mut next = DevicePrefs::default();
+        next.stem_actions.left_double = StemAction::NextTrack;
+        assert_eq!(stem_config_update(&default, &next), Some(vec![0x02]));
+        assert_eq!(stem_config_update(&next, &next.clone()), None);
+        let mut with_command = next.clone();
+        with_command.stem_actions.right_double = StemAction::Command("notify-send hi".to_string());
+        assert_eq!(stem_config_update(&next, &with_command), None);
+        assert_eq!(stem_config_update(&next, &default), Some(vec![0x00]));
+    }
+}
