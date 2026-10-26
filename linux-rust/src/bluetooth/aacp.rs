@@ -448,10 +448,42 @@ pub enum AACPEvent {
     StemPress(StemPressType, StemPressBudType),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AirPodsLEKeys {
     pub irk: String,
     pub enc_key: String,
+}
+
+/// The LE keys let anyone track the AirPods and decrypt their adverts: never print them whole.
+impl std::fmt::Debug for AirPodsLEKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |key: &str| {
+            if key.is_empty() {
+                "<none>".to_string()
+            } else {
+                format!("{}…", key.chars().take(4).collect::<String>())
+            }
+        };
+        f.debug_struct("AirPodsLEKeys")
+            .field("irk", &redact(&self.irk))
+            .field("enc_key", &redact(&self.enc_key))
+            .finish()
+    }
+}
+
+/// Key types and sizes only, for logging.
+fn describe_proximity_keys(keys: &[(u8, Vec<u8>)]) -> String {
+    keys.iter()
+        .map(|(key_type, data)| {
+            let name = match ProximityKeyType::from_u8(*key_type) {
+                Some(ProximityKeyType::Irk) => "IRK".to_string(),
+                Some(ProximityKeyType::EncKey) => "ENC_KEY".to_string(),
+                None => format!("type {:#04x}", key_type),
+            };
+            format!("{} ({} bytes)", name, data.len())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub struct AACPManagerState {
@@ -839,10 +871,8 @@ impl AACPManager {
                     offset += key_length;
                 }
                 info!(
-                    "Received Proximity Keys Response: {:?}",
-                    keys.iter()
-                        .map(|(kt, kd)| (kt, hex::encode(kd)))
-                        .collect::<Vec<_>>()
+                    "Received Proximity Keys Response: {}",
+                    describe_proximity_keys(&keys)
                 );
                 let airpods_mac = self.state.lock().await.airpods_mac;
                 if let Some(mac) = airpods_mac {
@@ -1314,6 +1344,25 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn le_keys_debug_is_redacted() {
+        let keys = AirPodsLEKeys {
+            irk: "00112233445566778899aabbccddeeff".to_string(),
+            enc_key: "ffeeddccbbaa99887766554433221100".to_string(),
+        };
+        let shown = format!("{:?}", keys);
+        assert!(!shown.contains("00112233445566778899"), "{shown}");
+        assert!(!shown.contains("ffeeddccbbaa99887766"), "{shown}");
+        assert!(shown.contains("0011…"), "{shown}");
+    }
+
+    #[test]
+    fn proximity_keys_summary_hides_key_bytes() {
+        let summary = describe_proximity_keys(&[(1, vec![0xcc; 16]), (4, vec![0x89; 16])]);
+        assert!(!summary.contains("cccc"));
+        assert_eq!(summary, "IRK (16 bytes), ENC_KEY (16 bytes)");
+    }
 
     #[test]
     fn every_identifier_round_trips() {

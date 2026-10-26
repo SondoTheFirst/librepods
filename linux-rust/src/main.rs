@@ -7,7 +7,7 @@ mod utils;
 
 use crate::bluetooth::battery_provider::BatteryReporter;
 use crate::bluetooth::discovery::{find_connected_airpods, find_other_managed_devices};
-use crate::bluetooth::le::start_le_monitor;
+use crate::bluetooth::le::{ConnectedAirPods, start_le_monitor};
 use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::DeviceData;
 use crate::devices::registry::DeviceRegistry;
@@ -157,9 +157,11 @@ async fn async_main(
     adapter.set_powered(true).await?;
 
     let airpods: DeviceRegistry<AirPodsDevice> = DeviceRegistry::new();
-    // Whether any AirPods hold an AACP connection; the BLE scanner only scans actively when not.
+    // Whether any AirPods are connected over Bluetooth (BlueZ Device1.Connected); the BLE
+    // scanner only scans actively when none are, so scanning never competes with their audio.
     let (aacp_connected_tx, aacp_connected_rx) = tokio::sync::watch::channel(false);
     let aacp_connected = Arc::new(aacp_connected_tx);
+    let connected_airpods = Arc::new(std::sync::Mutex::new(ConnectedAirPods::default()));
     let battery_reporter = BatteryReporter::register().await;
 
     info!("Listening for new connections.");
@@ -172,13 +174,18 @@ async fn async_main(
                 .await?
                 .unwrap_or_else(|| "Unknown".to_string());
             info!("Found connected AirPods: {}, initializing.", name);
+            set_airpods_connected(
+                &connected_airpods,
+                &aacp_connected,
+                &device.address().to_string(),
+                true,
+            );
             connect_airpods(
                 airpods.clone(),
                 device.address(),
                 tray_handle.clone(),
                 ui_tx.clone(),
                 device_managers.clone(),
-                aacp_connected.clone(),
                 battery_reporter.clone(),
             )
             .await;
@@ -285,11 +292,11 @@ async fn async_main(
             if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceDisconnected(addr_str.clone())) {
                 warn!("Failed to send DeviceDisconnected UI message: {:?}", e);
             }
+            set_airpods_connected(&connected_airpods, &aacp_connected, &addr_str, false);
             tokio::spawn(disconnect_airpods(
                 airpods.clone(),
                 addr_str.clone(),
                 tray_handle.clone(),
-                aacp_connected.clone(),
             ));
             return true;
         }
@@ -327,13 +334,13 @@ async fn async_main(
             .get::<String>("org.bluez.Device1", "Name")
             .unwrap_or_else(|_| "Unknown".to_string());
         info!("AirPods connected: {}, initializing", name);
+        set_airpods_connected(&connected_airpods, &aacp_connected, &addr_str, true);
         tokio::spawn(connect_airpods(
             airpods.clone(),
             addr,
             tray_handle.clone(),
             ui_tx.clone(),
             device_managers.clone(),
-            aacp_connected.clone(),
             battery_reporter.clone(),
         ));
         true
@@ -352,12 +359,11 @@ async fn connect_airpods(
     tray_handle: Option<ksni::Handle<MyTray>>,
     ui_tx: tokio::sync::mpsc::UnboundedSender<BluetoothUIMessage>,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
-    aacp_connected: Arc<tokio::sync::watch::Sender<bool>>,
     battery_reporter: Option<BatteryReporter>,
 ) {
     let mac = addr.to_string();
     let addr_str = mac.clone();
-    let registered = registry
+    registry
         .connect_with(&mac, move || async move {
             let device =
                 AirPodsDevice::new(addr, tray_handle, ui_tx.clone(), battery_reporter).await?;
@@ -374,9 +380,6 @@ async fn connect_airpods(
             Some(device)
         })
         .await;
-    if registered {
-        aacp_connected.send_replace(true);
-    }
 }
 
 /// Tears down the AirPods instance for `mac` and clears its state from the tray.
@@ -384,12 +387,10 @@ async fn disconnect_airpods(
     registry: DeviceRegistry<AirPodsDevice>,
     mac: String,
     tray_handle: Option<ksni::Handle<MyTray>>,
-    aacp_connected: Arc<tokio::sync::watch::Sender<bool>>,
 ) {
     if !registry.disconnect(&mac).await {
         return;
     }
-    aacp_connected.send_replace(false);
     if let Some(handle) = tray_handle {
         handle
             .update(|tray: &mut MyTray| {
@@ -406,4 +407,18 @@ async fn disconnect_airpods(
             })
             .await;
     }
+}
+
+/// Records one AirPods pair's Bluetooth connection and tells the BLE scanner whether any are up.
+fn set_airpods_connected(
+    connected_airpods: &std::sync::Mutex<ConnectedAirPods>,
+    aacp_connected: &tokio::sync::watch::Sender<bool>,
+    mac: &str,
+    connected: bool,
+) {
+    let any = connected_airpods
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set(mac, connected);
+    aacp_connected.send_replace(any);
 }

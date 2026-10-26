@@ -15,7 +15,7 @@ use bluer::monitor::{Monitor, MonitorEvent, Pattern};
 use bluer::{Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, Session};
 use futures::StreamExt;
 use log::{debug, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, watch};
@@ -31,6 +31,56 @@ pub enum ScanMode {
     Monitor,
     /// Active LE discovery: only while no AirPods are connected over AACP.
     Discovery,
+}
+
+/// Which AirPods currently have a Bluetooth connection (from BlueZ `Device1.Connected`).
+#[derive(Default)]
+pub struct ConnectedAirPods(HashSet<String>);
+
+impl ConnectedAirPods {
+    /// Records one pair's state and returns whether any AirPods are still connected.
+    pub fn set(&mut self, mac: &str, connected: bool) -> bool {
+        if connected {
+            self.0.insert(mac.to_string());
+        } else {
+            self.0.remove(mac);
+        }
+        !self.0.is_empty()
+    }
+}
+
+/// Discovery runs in short bursts so it doesn't hog the radio the keyboard, mouse and other
+/// Bluetooth devices share.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanSchedule {
+    pub burst: Duration,
+    pub pause: Duration,
+}
+
+impl ScanSchedule {
+    pub const DEFAULT: ScanSchedule = ScanSchedule {
+        burst: Duration::from_secs(12),
+        pause: Duration::from_secs(48),
+    };
+
+    fn position(&self, elapsed: Duration) -> Duration {
+        let cycle = (self.burst + self.pause).as_millis().max(1);
+        Duration::from_millis((elapsed.as_millis() % cycle) as u64)
+    }
+
+    pub fn is_scanning(&self, elapsed: Duration) -> bool {
+        self.position(elapsed) < self.burst
+    }
+
+    /// Time left in the current phase (burst or pause).
+    pub fn remaining(&self, elapsed: Duration) -> Duration {
+        let position = self.position(elapsed);
+        if position < self.burst {
+            self.burst - position
+        } else {
+            self.burst + self.pause - position
+        }
+    }
 }
 
 pub fn should_scan(mode: ScanMode, aacp_connected: bool) -> bool {
@@ -142,12 +192,20 @@ impl AdvertHandler {
         }
     }
 
-    /// Re-reads keys learned on recent connections; forgets address decisions made with old keys.
+    /// Re-reads keys learned on recent connections and starts a fresh scan session.
     fn reload_keys(&mut self) {
         self.known = load_known_airpods();
+        self.reset_session();
+        debug!("Loaded LE keys for {} AirPods", self.known.len());
+    }
+
+    /// Forgets address decisions and the last adverts, so the first advert of a new session
+    /// always reaches the tray (it may have been cleared on disconnect).
+    fn reset_session(&mut self) {
         self.verified.clear();
         self.foreign.clear();
-        debug!("Loaded LE keys for {} AirPods", self.known.len());
+        self.last_buds.clear();
+        self.last_case = None;
     }
 
     fn resolve(&mut self, address: Address, now: Instant) -> Option<usize> {
@@ -354,9 +412,10 @@ async fn run_discovery(
     handler: Arc<Mutex<AdvertHandler>>,
     mut aacp_connected: watch::Receiver<bool>,
 ) -> bluer::Result<()> {
+    let schedule = ScanSchedule::DEFAULT;
     let filter = DiscoveryFilter {
         transport: DiscoveryTransport::Le,
-        duplicate_data: true,
+        duplicate_data: false,
         ..Default::default()
     };
     loop {
@@ -365,41 +424,72 @@ async fn run_discovery(
                 return Ok(());
             }
         }
+        info!(
+            "BLE scanning in {:?} mode ({} s bursts every {} s, AirPods not connected)",
+            ScanMode::Discovery,
+            schedule.burst.as_secs(),
+            (schedule.burst + schedule.pause).as_secs()
+        );
+        let started = Instant::now();
 
-        handler.lock().await.reload_keys();
-        if let Err(e) = adapter.set_discovery_filter(filter.clone()).await {
-            debug!("Could not set LE discovery filter: {}", e);
-        }
-        let mut events = match adapter.discover_devices_with_changes().await {
-            Ok(events) => events,
-            Err(e) => {
-                warn!("Could not start LE discovery: {}", e);
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                continue;
-            }
-        };
-        info!("BLE scanning in {:?} mode (AirPods not connected)", ScanMode::Discovery);
+        'allowed: loop {
+            let elapsed = started.elapsed();
+            let phase_end = tokio::time::sleep(schedule.remaining(elapsed));
+            tokio::pin!(phase_end);
 
-        loop {
-            tokio::select! {
-                changed = aacp_connected.changed() => {
-                    if changed.is_err() || !should_scan(ScanMode::Discovery, *aacp_connected.borrow()) {
-                        break;
+            if schedule.is_scanning(elapsed) {
+                handler.lock().await.reload_keys();
+                if let Err(e) = adapter.set_discovery_filter(filter.clone()).await {
+                    debug!("Could not set LE discovery filter: {}", e);
+                }
+                let mut events = match adapter.discover_devices_with_changes().await {
+                    Ok(events) => events,
+                    Err(e) => {
+                        warn!("Could not start LE discovery: {}", e);
+                        tokio::select! {
+                            _ = &mut phase_end => continue 'allowed,
+                            changed = aacp_connected.changed() => {
+                                if changed.is_err() || !should_scan(ScanMode::Discovery, *aacp_connected.borrow()) {
+                                    break 'allowed;
+                                }
+                                continue 'allowed;
+                            }
+                        }
+                    }
+                };
+                debug!("BLE scan burst started");
+                loop {
+                    tokio::select! {
+                        _ = &mut phase_end => break,
+                        changed = aacp_connected.changed() => {
+                            if changed.is_err() || !should_scan(ScanMode::Discovery, *aacp_connected.borrow()) {
+                                break 'allowed;
+                            }
+                        }
+                        event = events.next() => {
+                            let Some(event) = event else { break };
+                            if let AdapterEvent::DeviceAdded(address) = event
+                                && let Ok(device) = adapter.device(address)
+                                && let Ok(Some(data)) = device.manufacturer_data().await
+                                && let Some(apple) = apple_data(&data)
+                            {
+                                handler.lock().await.handle(address, apple).await;
+                            }
+                        }
                     }
                 }
-                event = events.next() => {
-                    let Some(event) = event else { break };
-                    if let AdapterEvent::DeviceAdded(address) = event
-                        && let Ok(device) = adapter.device(address)
-                        && let Ok(Some(data)) = device.manufacturer_data().await
-                        && let Some(apple) = apple_data(&data)
-                    {
-                        handler.lock().await.handle(address, apple).await;
+                debug!("BLE scan burst ended");
+            } else {
+                tokio::select! {
+                    _ = &mut phase_end => {}
+                    changed = aacp_connected.changed() => {
+                        if changed.is_err() || !should_scan(ScanMode::Discovery, *aacp_connected.borrow()) {
+                            break 'allowed;
+                        }
                     }
                 }
             }
         }
-        drop(events);
         info!("LE discovery stopped");
     }
 }
@@ -410,6 +500,71 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MAC: &str = "8C:7A:AA:D0:3B:50";
+
+    #[test]
+    fn any_airpods_connected_tracks_each_pair() {
+        let mut connected = ConnectedAirPods::default();
+        assert!(connected.set("AA:AA:AA:AA:AA:01", true));
+        assert!(connected.set("AA:AA:AA:AA:AA:02", true));
+        assert!(connected.set("AA:AA:AA:AA:AA:01", false)); // the other pair is still connected
+        assert!(!connected.set("AA:AA:AA:AA:AA:02", false));
+    }
+
+    #[test]
+    fn disconnect_of_unknown_device_changes_nothing() {
+        let mut connected = ConnectedAirPods::default();
+        connected.set(MAC, true);
+        assert!(connected.set("11:22:33:44:55:66", false));
+    }
+
+    #[test]
+    fn scan_schedule_bursts() {
+        let schedule = ScanSchedule {
+            burst: Duration::from_secs(12),
+            pause: Duration::from_secs(48),
+        };
+        assert!(schedule.is_scanning(Duration::ZERO));
+        assert!(schedule.is_scanning(Duration::from_secs(11)));
+        assert!(!schedule.is_scanning(Duration::from_secs(12)));
+        assert!(!schedule.is_scanning(Duration::from_secs(59)));
+        assert!(schedule.is_scanning(Duration::from_secs(60)));
+        assert_eq!(schedule.remaining(Duration::from_secs(5)), Duration::from_secs(7));
+        assert_eq!(schedule.remaining(Duration::from_secs(20)), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn new_scan_session_forgets_last_adverts() {
+        use crate::bluetooth::proximity::{AccessoryState, BudsAdvert, CaseAdvert, Level};
+        let level = Some(Level { percent: 50, charging: false });
+        let (_tx, rx) = watch::channel(false);
+        let mut handler = AdvertHandler {
+            tray_handle: None,
+            aacp_connected: rx,
+            known: vec![],
+            verified: HashMap::new(),
+            foreign: HashMap::new(),
+            last_buds: HashMap::from([(
+                MAC.to_string(),
+                BudsAdvert {
+                    model_id: 0x0E20,
+                    primary_left: true,
+                    left_in_ear: false,
+                    right_in_ear: false,
+                    lid_open: true,
+                    color: 0,
+                    state: AccessoryState::Idle,
+                    left: level,
+                    right: level,
+                    case: level,
+                },
+            )]),
+            last_case: Some(CaseAdvert { case: level, left: level, right: level }),
+            gate: AutoConnectGate::new(Duration::from_secs(60)),
+        };
+        handler.reset_session();
+        assert!(handler.last_buds.is_empty());
+        assert!(handler.last_case.is_none());
+    }
 
     #[test]
     fn scan_policy_never_scans_while_connected() {
