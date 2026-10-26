@@ -1,7 +1,7 @@
 use crate::bluetooth::aacp_parse;
 use crate::devices::models::AirPodsModel;
 use crate::devices::enums::DeviceData;
-use crate::devices::settings::trim_value;
+use crate::devices::settings::{firmware_major, trim_value};
 use crate::utils::{apply_information, apply_le_key, get_devices_path, update_devices_file};
 use bluer::{
     Address, AddressType, Error, Result,
@@ -36,7 +36,8 @@ pub mod opcodes {
     pub const PROXIMITY_KEYS_REQ: u8 = 0x30;
     pub const PROXIMITY_KEYS_RSP: u8 = 0x31;
     pub const STEM_PRESS: u8 = 0x19;
-    pub const EQ_DATA: u8 = 0x53;
+    pub const HEADPHONE_ACCOMMODATION: u8 = 0x53;
+    pub const CUSTOM_EQ: u8 = 0x63;
     pub const CONNECTED_DEVICES: u8 = 0x2E;
     pub const AUDIO_SOURCE: u8 = 0x0E;
     pub const SMART_ROUTING: u8 = 0x10;
@@ -447,6 +448,13 @@ pub enum AACPEvent {
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
     StemPress(StemPressType, StemPressBudType),
+    CustomEq(aacp_parse::CustomEq),
+    HeadphoneAccommodation(aacp_parse::Accommodation),
+    /// Sent for every Information packet, once the model and firmware are known.
+    DeviceInfo {
+        model: AirPodsModel,
+        firmware_major: Option<u32>,
+    },
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -503,12 +511,15 @@ pub struct AACPManagerState {
     pub bud_role: Option<aacp_parse::BudRole>,
     pub capabilities: Vec<(u8, Vec<u8>)>,
     pub model: Option<AirPodsModel>,
+    pub firmware_major: Option<u32>,
+    pub custom_eq: Option<aacp_parse::CustomEq>,
+    pub accommodation: Option<aacp_parse::Accommodation>,
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub airpods_mac: Option<Address>,
 }
 
 impl AACPManagerState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         AACPManagerState {
             sender: None,
             control_command_status_list: Vec::new(),
@@ -524,6 +535,9 @@ impl AACPManagerState {
             bud_role: None,
             capabilities: Vec::new(),
             model: None,
+            firmware_major: None,
+            custom_eq: None,
+            accommodation: None,
             event_tx: None,
             airpods_mac: None,
         }
@@ -812,17 +826,26 @@ impl AACPManager {
                     return;
                 };
                 let model = AirPodsModel::from_model_number(&info.model_number);
+                let firmware_major = firmware_major(&info.version3);
                 let airpods_mac = {
                     let mut state = self.state.lock().await;
                     if state.model.is_none() {
                         info!(
-                            "Detected {} ({}), capabilities: {:?}",
+                            "Detected {} ({}), firmware major {:?}, capabilities: {:?}",
                             model.display_name(),
                             info.model_number,
+                            firmware_major,
                             model.capabilities()
                         );
                     }
                     state.model = Some(model);
+                    state.firmware_major = firmware_major;
+                    if let Some(ref tx) = state.event_tx {
+                        let _ = tx.send(AACPEvent::DeviceInfo {
+                            model,
+                            firmware_major,
+                        });
+                    }
                     state.airpods_mac
                 };
                 if let Some(mac) = airpods_mac {
@@ -972,8 +995,32 @@ impl AACPManager {
                 );
                 self.state.lock().await.capabilities = capabilities;
             }
-            opcodes::EQ_DATA => {
-                debug!("Received EQ Data");
+            opcodes::CUSTOM_EQ => {
+                let Some(eq) = aacp_parse::parse_custom_eq(payload) else {
+                    debug!("Ignoring unrecognized Custom EQ packet: {}", hex::encode(payload));
+                    return;
+                };
+                let mut state = self.state.lock().await;
+                state.custom_eq = Some(eq);
+                if let Some(ref tx) = state.event_tx {
+                    let _ = tx.send(AACPEvent::CustomEq(eq));
+                }
+                info!("Received Custom EQ: {:?}", eq);
+            }
+            opcodes::HEADPHONE_ACCOMMODATION => {
+                let Some(accommodation) = aacp_parse::parse_accommodation(payload) else {
+                    debug!(
+                        "Ignoring unrecognized Headphone Accommodation packet: {}",
+                        hex::encode(payload)
+                    );
+                    return;
+                };
+                let mut state = self.state.lock().await;
+                state.accommodation = Some(accommodation);
+                if let Some(ref tx) = state.event_tx {
+                    let _ = tx.send(AACPEvent::HeadphoneAccommodation(accommodation));
+                }
+                info!("Received Headphone Accommodation: {:?}", accommodation);
             }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
@@ -1014,16 +1061,34 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
+    /// Renames the AirPods; a name that is empty or too long is rejected without sending.
     pub async fn send_rename_packet(&self, name: &str) -> Result<()> {
-        let name_bytes = name.as_bytes();
-        let size = name_bytes.len();
-        let mut packet = Vec::with_capacity(6 + size);
-        packet.push(opcodes::RENAME);
-        packet.push(0x00);
-        packet.push(0x01);
-        packet.push(size as u8);
-        packet.push(0x00);
-        packet.extend_from_slice(name_bytes);
+        let Some(payload) = aacp_parse::rename_payload(name) else {
+            return Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "AirPods names must be 1 to 255 bytes long",
+            )));
+        };
+        let packet = [[opcodes::RENAME, 0x00].as_slice(), payload.as_slice()].concat();
+        self.send_data_packet(&packet).await
+    }
+
+    pub async fn send_custom_eq(&self, eq: aacp_parse::CustomEq) -> Result<()> {
+        let payload = aacp_parse::custom_eq_payload(eq);
+        let packet = [[opcodes::CUSTOM_EQ, 0x00].as_slice(), payload.as_slice()].concat();
+        self.send_data_packet(&packet).await
+    }
+
+    pub async fn send_headphone_accommodation(
+        &self,
+        accommodation: &aacp_parse::Accommodation,
+    ) -> Result<()> {
+        let payload = aacp_parse::accommodation_payload(accommodation);
+        let packet = [
+            [opcodes::HEADPHONE_ACCOMMODATION, 0x00].as_slice(),
+            payload.as_slice(),
+        ]
+        .concat();
         self.send_data_packet(&packet).await
     }
 
@@ -1312,6 +1377,9 @@ fn clear_connection_state(state: &mut AACPManagerState) {
     state.bud_role = None;
     state.capabilities.clear();
     state.model = None;
+    state.firmware_major = None;
+    state.custom_eq = None;
+    state.accommodation = None;
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
@@ -1394,6 +1462,22 @@ mod tests {
         assert!(state.model.is_none());
         assert!(state.bud_role.is_none());
         assert!(state.capabilities.is_empty());
+    }
+
+    #[test]
+    fn clearing_connection_state_forgets_eq_and_accommodation() {
+        let mut state = AACPManagerState::new();
+        state.custom_eq = Some(aacp_parse::CustomEq { enabled: true, low: 1, mid: 2, high: 3 });
+        state.accommodation = Some(aacp_parse::Accommodation {
+            phone: true,
+            media: false,
+            bands: [50.0; 8],
+        });
+        state.firmware_major = Some(6);
+        clear_connection_state(&mut state);
+        assert!(state.custom_eq.is_none());
+        assert!(state.accommodation.is_none());
+        assert!(state.firmware_major.is_none());
     }
 
     #[test]
