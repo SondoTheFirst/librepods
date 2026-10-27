@@ -1,6 +1,7 @@
 //! Watches the AirPods' BLE adverts for battery, lid and connection state. Uses BlueZ's
 //! advertisement monitor when available; otherwise falls back to plain LE discovery, but only
-//! while no AirPods hold an AACP connection, so scanning never competes with audio.
+//! while no AirPods hold an AACP connection, so scanning never competes with audio, and only
+//! when some AirPods have auto-connect on, so it doesn't hold up keyboards and mice.
 
 use crate::bluetooth::aacp::BatteryStatus;
 use crate::bluetooth::proximity::{
@@ -30,7 +31,8 @@ const FOREIGN_ADDRESS_TTL: Duration = Duration::from_secs(600);
 pub enum ScanMode {
     /// BlueZ advertisement monitor: passive, harmless while audio plays.
     Monitor,
-    /// Active LE discovery: only while no AirPods are connected over AACP.
+    /// Active LE discovery: only while no AirPods are connected over AACP and some have
+    /// auto-connect on.
     Discovery,
 }
 
@@ -124,6 +126,12 @@ pub fn auto_connect_enabled(prefs_json: &str, mac: &str) -> bool {
     parse_prefs(prefs_json)
         .get(mac)
         .is_some_and(|prefs| prefs.auto_connect)
+}
+
+/// While discovery runs, BLE keyboards and mice can't reconnect (seen on an Intel AX200), so
+/// bursts only run when some AirPods have auto-connect on.
+pub fn burst_due(schedule: &ScanSchedule, elapsed: Duration, prefs_json: &str) -> bool {
+    schedule.is_scanning(elapsed) && parse_prefs(prefs_json).values().any(|p| p.auto_connect)
 }
 
 struct KnownAirPods {
@@ -425,7 +433,7 @@ async fn run_discovery(
             }
         }
         info!(
-            "BLE scanning in {:?} mode ({} s bursts every {} s, AirPods not connected)",
+            "BLE scanning in {:?} mode ({} s bursts every {} s, AirPods not connected, only while auto-connect is on)",
             ScanMode::Discovery,
             schedule.burst.as_secs(),
             (schedule.burst + schedule.pause).as_secs()
@@ -437,7 +445,8 @@ async fn run_discovery(
             let phase_end = tokio::time::sleep(schedule.remaining(elapsed));
             tokio::pin!(phase_end);
 
-            if schedule.is_scanning(elapsed) {
+            let prefs = std::fs::read_to_string(get_preferences_path()).unwrap_or_default();
+            if burst_due(&schedule, elapsed, &prefs) {
                 handler.lock().await.reload_keys();
                 if let Err(e) = adapter.set_discovery_filter(filter.clone()).await {
                     debug!("Could not set LE discovery filter: {}", e);
@@ -530,6 +539,19 @@ mod tests {
         assert!(schedule.is_scanning(Duration::from_secs(60)));
         assert_eq!(schedule.remaining(Duration::from_secs(5)), Duration::from_secs(7));
         assert_eq!(schedule.remaining(Duration::from_secs(20)), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn bursts_only_run_when_some_airpods_auto_connect() {
+        let schedule = ScanSchedule::DEFAULT;
+        // Discovery stops BLE keyboards and mice from reconnecting, so no auto-connect means no bursts.
+        assert!(!burst_due(&schedule, Duration::ZERO, ""));
+        assert!(!burst_due(&schedule, Duration::ZERO, "{}"));
+        let off = format!(r#"{{"{MAC}":{{"autoConnect":false,"earDetection":true}}}}"#);
+        assert!(!burst_due(&schedule, Duration::ZERO, &off));
+        let on = format!(r#"{{"11:22:33:44:55:66":{{}},"{MAC}":{{"autoConnect":true}}}}"#);
+        assert!(burst_due(&schedule, Duration::ZERO, &on));
+        assert!(!burst_due(&schedule, Duration::from_secs(30), &on)); // still pauses between bursts
     }
 
     #[test]
